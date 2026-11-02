@@ -477,6 +477,10 @@ impl fmt::Debug for Pending {
 pub enum Begun {
     Signed(Tokens),
     Code(Pending),
+    /// The password went out and the sign-in then failed. Posting it again could
+    /// cost another code or count toward a lockout, unlike a failure before the
+    /// post, which `begin` returns as an error and is safe to retry.
+    FailedAfterPost(CliError),
 }
 
 /// From the authorize request through the password: a token, or the code step.
@@ -513,9 +517,20 @@ pub async fn begin<T: Transport>(
     let post = HttpRequest::new("POST", target.clone())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(form_body(&fields));
+    let outcome = after_the_password(transport, jar, post, target, &pkce.verifier).await;
+    Ok(outcome.unwrap_or_else(Begun::FailedAfterPost))
+}
+
+async fn after_the_password<T: Transport>(
+    transport: &T,
+    mut jar: Jar,
+    post: HttpRequest,
+    target: String,
+    verifier: &str,
+) -> Result<Begun, CliError> {
     let posted = transport.send(jar.apply(base(post))).await?;
     match land(transport, &mut jar, posted, target).await? {
-        Landing::Code(code) => exchange(transport, &code, &pkce.verifier)
+        Landing::Code(code) => exchange(transport, &code, verifier)
             .await
             .map(Begun::Signed),
         Landing::Page(page, url) => {
@@ -523,7 +538,7 @@ pub async fn begin<T: Transport>(
                 return Err(stopped_at(&page));
             };
             Ok(Begun::Code(Pending {
-                verifier: pkce.verifier.clone(),
+                verifier: verifier.to_string(),
                 cookies: jar,
                 target: form_target(&step.action, &url)?,
                 field: step.field,
@@ -684,6 +699,7 @@ mod tests {
         match begin(transport, email, password, pkce).await? {
             Begun::Signed(tokens) => Ok(tokens),
             Begun::Code(pending) => panic!("unexpected code step: {pending:?}"),
+            Begun::FailedAfterPost(err) => Err(err),
         }
     }
 

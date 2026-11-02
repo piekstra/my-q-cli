@@ -65,7 +65,7 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
 
     fn apply(&self, mut credentials: Credentials, tokens: Tokens) -> Result<String, CliError> {
         let access = tokens.access_token.clone();
-        credentials.apply_tokens(tokens);
+        credentials.apply_tokens(tokens, unix_now());
         self.store.save(&credentials)?;
         Ok(access)
     }
@@ -110,17 +110,16 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
             return Err(sign_in_needed());
         };
         let pkce = Pkce::generate()?;
-        match auth::begin(&self.transport, &credentials.email, &password, &pkce).await {
-            Ok(Begun::Signed(tokens)) => self.apply(credentials, tokens),
-            Ok(Begun::Code(_)) => {
+        match auth::begin(&self.transport, &credentials.email, &password, &pkce).await? {
+            Begun::Signed(tokens) => self.apply(credentials, tokens),
+            Begun::Code(_) => {
                 self.block_password(credentials)?;
                 Err(sign_in_needed())
             }
-            Err(err @ CliError::Auth(_)) => {
+            Begun::FailedAfterPost(err) => {
                 self.block_password(credentials)?;
-                Err(err)
+                Err(password_now_blocked(err))
             }
-            Err(other) => Err(other),
         }
     }
 
@@ -243,7 +242,8 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
                 confirmed: true,
             });
         }
-        if door.state != command.moving() {
+        let sent = door.state != command.moving();
+        if sent {
             if door.online == Some(false) {
                 return Err(CliError::Upstream(format!(
                     "`{}` is offline, so myQ cannot move it",
@@ -254,6 +254,7 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
         }
 
         let name = door.name.clone();
+        let after_read = |err: CliError| if sent { unconfirmed(&name, err) } else { err };
         let read = |door: Door| async move {
             let doors = self.doors(account).await?;
             let read_back = doors.into_iter().find(|d| d.serial == door.serial);
@@ -263,8 +264,8 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
         };
         if wait.timeout.is_zero() {
             return Ok(DoorChange {
-                door: read(door).await.map_err(|e| unconfirmed(&name, e))?,
-                changed: true,
+                door: read(door).await.map_err(after_read)?,
+                changed: sent,
                 confirmed: false,
             });
         }
@@ -276,17 +277,22 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
         let mut latest = door;
         for _ in 0..polls {
             pause(wait.interval);
-            latest = read(latest).await.map_err(|e| unconfirmed(&name, e))?;
+            latest = read(latest).await.map_err(after_read)?;
             if latest.state == command.target() {
                 return Ok(DoorChange {
                     door: latest,
-                    changed: true,
+                    changed: sent,
                     confirmed: true,
                 });
             }
         }
+        let opening = if sent {
+            "myQ accepted the command, but"
+        } else {
+            "No command was sent because the door was already moving, and"
+        };
         Err(CliError::Upstream(format!(
-            "myQ accepted the command, but `{}` still reads `{}` after {} seconds. \
+            "{opening} `{}` still reads `{}` after {} seconds. \
              Check the door before sending it again",
             latest.name,
             latest.state,
@@ -333,10 +339,21 @@ fn unconfirmed(name: &str, err: CliError) -> CliError {
         "myQ accepted the command, so `{name}` may be moving, but reading it back failed: {err}. \
          Check the door before sending it again"
     );
+    // Never `NotFound`: that reads as a wrong door name, and nothing having happened.
     match err {
         CliError::Auth(_) => CliError::Auth(text),
-        CliError::NotFound(_) => CliError::NotFound(text),
         CliError::Keychain(_) => CliError::Keychain(text),
+        _ => CliError::Upstream(text),
+    }
+}
+
+fn password_now_blocked(err: CliError) -> CliError {
+    let text = format!(
+        "{err}. The stored password will not be posted again: find the cause, then run `{} auth login`",
+        crate::BIN
+    );
+    match err {
+        CliError::Auth(_) => CliError::Auth(text),
         _ => CliError::Upstream(text),
     }
 }
@@ -670,7 +687,44 @@ mod tests {
     }
 
     #[test]
-    fn an_outage_during_the_password_post_does_not_block_the_password() {
+    fn a_refused_token_exchange_blocks_the_password_it_followed() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+            HttpResponse::new(200, include_str!("../tests/fixtures/login_page.html")),
+            HttpResponse::new(302, "").header("location", "com.myqops://android?code=dummycode"),
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+        ]);
+        let store = expired();
+        let client = Client::new(&scripted, &store);
+        let err = block_on(client.doors(ACCOUNT)).unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert!(
+            err.to_string().contains("will not be posted again"),
+            "{err}"
+        );
+        assert!(store.0.borrow().as_ref().unwrap().password_blocked);
+
+        let scripted = Scripted::new(vec![HttpResponse::new(400, r#"{"error":"invalid_grant"}"#)]);
+        let client = Client::new(&scripted, &store);
+        block_on(client.doors(ACCOUNT)).unwrap_err();
+        assert_eq!(scripted.sent().len(), 1, "the password is not tried again");
+    }
+
+    #[test]
+    fn a_failed_answer_to_the_password_post_blocks_it() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+            HttpResponse::new(200, include_str!("../tests/fixtures/login_page.html")),
+            HttpResponse::new(429, ""),
+        ]);
+        let store = expired();
+        let client = Client::new(&scripted, &store);
+        block_on(client.doors(ACCOUNT)).unwrap_err();
+        assert!(store.0.borrow().as_ref().unwrap().password_blocked);
+    }
+
+    #[test]
+    fn an_outage_before_the_password_post_does_not_block_it() {
         let scripted = Scripted::new(vec![
             HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(503, ""),
@@ -868,8 +922,38 @@ mod tests {
         let client = Client::new(&scripted, signed_in());
         let change =
             block_on(client.set_door(ACCOUNT, "left", DoorCommand::Open, FAST, &|_| {})).unwrap();
-        assert!(change.confirmed);
+        assert!(change.confirmed && !change.changed);
         assert!(scripted.sent().iter().all(|r| r.method == "GET"));
+    }
+
+    #[test]
+    fn a_stalled_door_that_got_no_command_does_not_claim_one() {
+        let scripted = Scripted::new(vec![
+            devices_with_left("opening"),
+            devices_with_left("opening"),
+            devices_with_left("opening"),
+            devices_with_left("opening"),
+        ]);
+        let client = Client::new(&scripted, signed_in());
+        let err = block_on(client.set_door(ACCOUNT, "left", DoorCommand::Open, FAST, &|_| {}))
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("No command was sent"), "{text}");
+        assert!(!text.contains("accepted"), "{text}");
+    }
+
+    #[test]
+    fn a_404_read_back_does_not_read_as_a_wrong_door_name() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(200, DEVICES_JSON),
+            HttpResponse::new(204, ""),
+            HttpResponse::new(404, ""),
+        ]);
+        let client = Client::new(&scripted, signed_in());
+        let err = block_on(client.set_door(ACCOUNT, "left", DoorCommand::Open, FAST, &|_| {}))
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("may be moving"), "{err}");
     }
 
     #[test]

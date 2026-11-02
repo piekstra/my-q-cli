@@ -8,6 +8,7 @@ use pk_cli_core::transport::Transport;
 use pk_cli_core::{block_on, CliError};
 
 use crate::auth::{self, Begun, Pending, Pkce, Tokens};
+use crate::client::unix_now;
 use crate::credential::{Credentials, ParkedView, TokenStore};
 
 /// How `auth login` may reach the person running it.
@@ -72,16 +73,24 @@ pub fn check_overwrite(
     Ok(())
 }
 
-/// Sign in with the email and password. Nothing is stored until myQ accepts them.
-/// When a code is needed and cannot be asked for here, this ends in exit 3 with the
-/// sign-in parked for [`resume`].
+/// How far a sign-in got, when myQ accepted the password.
+#[derive(Debug)]
+pub enum Started {
+    Signed(Credentials),
+    /// Stopped at the code step, usually parked for [`resume`]. This is how the
+    /// command ends (exit 3 when it is waiting on a code).
+    WaitingOnCode(CliError),
+}
+
+/// Sign in with the email and password. `Err` means myQ did not accept them, and
+/// nothing was stored.
 pub fn start<T: Transport, S: TokenStore>(
     transport: &T,
     store: &S,
     email: &str,
     password: &str,
     prompting: Prompting,
-) -> Result<Credentials, CliError> {
+) -> Result<Started, CliError> {
     let seed = Credentials {
         email: email.to_string(),
         password: Some(password.to_string()),
@@ -89,19 +98,24 @@ pub fn start<T: Transport, S: TokenStore>(
     };
     let pkce = Pkce::generate()?;
     match block_on(auth::begin(transport, email, password, &pkce))? {
-        Begun::Signed(tokens) => keep_session(store, seed, tokens),
+        Begun::Signed(tokens) => keep_session(store, seed, tokens).map(Started::Signed),
+        Begun::FailedAfterPost(err) => Err(err),
         Begun::Code(pending) => {
             let step = CodeStep {
                 transport,
                 reached: RefCell::new(Some(pending)),
             };
             let slot = ParkedView::new(store, Some(seed));
-            let tokens = OtpLogin::new(crate::BIN, &step, &slot)
+            let flow = OtpLogin::new(crate::BIN, &step, &slot)
                 .interactive(prompting.interactive)
-                .quiet(prompting.quiet)
-                .start()?;
-            let item = store.load()?.unwrap_or_default();
-            keep_session(store, item, tokens)
+                .quiet(prompting.quiet);
+            match flow.start() {
+                Ok(tokens) => {
+                    let item = store.load()?.unwrap_or_default();
+                    keep_session(store, item, tokens).map(Started::Signed)
+                }
+                Err(err) => Ok(Started::WaitingOnCode(err)),
+            }
         }
     }
 }
@@ -131,7 +145,7 @@ fn keep_session<S: TokenStore>(
     mut item: Credentials,
     tokens: Tokens,
 ) -> Result<Credentials, CliError> {
-    item.apply_tokens(tokens);
+    item.apply_tokens(tokens, unix_now());
     item.pending = None;
     store.save(&item)?;
     Ok(item)
@@ -162,7 +176,7 @@ mod tests {
         ]
     }
 
-    fn start_with(script: Vec<HttpResponse>, store: &Memory) -> Result<Credentials, CliError> {
+    fn start_with(script: Vec<HttpResponse>, store: &Memory) -> Result<Started, CliError> {
         let scripted = Scripted::new(script);
         start(
             &scripted,
@@ -177,7 +191,9 @@ mod tests {
         let mut script = to_the_password();
         script.push(HttpResponse::new(200, CODE_PAGE));
         let store = Memory::default();
-        let err = start_with(script, &store).unwrap_err();
+        let Started::WaitingOnCode(err) = start_with(script, &store).unwrap() else {
+            panic!("expected the code step");
+        };
         assert_eq!(err.exit_code(), 3);
         assert!(err.to_string().contains("--code"), "{err}");
         store
@@ -206,6 +222,27 @@ mod tests {
         let store = Memory::default();
         let err = start_with(script, &store).unwrap_err();
         assert!(err.to_string().contains("lock the account"), "{err}");
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_refused_password_is_not_mistaken_for_an_earlier_waiting_sign_in() {
+        let store = parked();
+        let mut script = to_the_password();
+        script.push(HttpResponse::new(200, LOGIN_PAGE));
+        assert!(start_with(script, &store).is_err());
+    }
+
+    #[test]
+    fn a_refused_token_exchange_after_the_password_is_an_error() {
+        let mut script = to_the_password();
+        script.extend([
+            redirect("com.myqops://android?code=dummycode"),
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+        ]);
+        let store = Memory::default();
+        let err = start_with(script, &store).unwrap_err();
+        assert_eq!(err.exit_code(), 5);
         assert!(store.load().unwrap().is_none());
     }
 

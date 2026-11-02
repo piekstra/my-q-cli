@@ -9,7 +9,6 @@ use pk_cli_secrets::CredentialStore;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::Tokens;
-use crate::client::unix_now;
 
 /// What a token response with no `expires_in` is taken to last.
 const DEFAULT_LIFETIME_SECS: u64 = 1800;
@@ -43,7 +42,8 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    pub fn apply_tokens(&mut self, tokens: Tokens) {
+    /// `now` is unix seconds.
+    pub fn apply_tokens(&mut self, tokens: Tokens, now: u64) {
         self.access_token = Some(tokens.access_token);
         if tokens.refresh_token.is_some() {
             self.refresh_token = tokens.refresh_token;
@@ -52,7 +52,21 @@ impl Credentials {
             .expires_in
             .unwrap_or(DEFAULT_LIFETIME_SECS)
             .min(MAX_LIFETIME_SECS);
-        self.expires_at = Some(unix_now().saturating_add(lifetime));
+        self.expires_at = Some(now.saturating_add(lifetime));
+    }
+
+    fn clear_session(&mut self) {
+        self.access_token = None;
+        self.refresh_token = None;
+        self.expires_at = None;
+    }
+
+    /// End the session and anything waiting. The password stays but is not posted,
+    /// so no later command signs back in behind the person who signed out.
+    pub fn sign_out(&mut self) {
+        self.clear_session();
+        self.pending = None;
+        self.password_blocked = true;
     }
 
     pub fn has_session(&self) -> bool {
@@ -115,6 +129,10 @@ impl<S: TokenStore> ParkingSlot for ParkedView<'_, S> {
     fn save(&self, parked: &ParkedLogin) -> Result<(), CliError> {
         let mut item = self.store.load()?.unwrap_or_default();
         if let Some(seed) = &self.seed {
+            // Another login's session must not answer for this one while it waits.
+            if item.email != seed.email {
+                item.clear_session();
+            }
             item.email = seed.email.clone();
             item.password = seed.password.clone();
         }
@@ -215,19 +233,62 @@ mod tests {
     }
 
     #[test]
+    fn parking_a_different_login_drops_the_old_session_and_the_same_login_keeps_it() {
+        let session = Credentials {
+            email: "old@example.invalid".into(),
+            access_token: Some("dummy-access".into()),
+            refresh_token: Some("dummy-refresh".into()),
+            expires_at: Some(1),
+            ..Credentials::default()
+        };
+        let seed = |email: &str| Credentials {
+            email: email.into(),
+            password: Some("dummy-password".into()),
+            ..Credentials::default()
+        };
+        let parked = ParkedLogin::new("dummy-session", 1);
+
+        let store = Memory(std::cell::RefCell::new(Some(session.clone())));
+        let slot = ParkedView::new(&store, Some(seed("new@example.invalid")));
+        slot.save(&parked).unwrap();
+        let item = store.0.borrow().clone().unwrap();
+        assert_eq!(item.email, "new@example.invalid");
+        assert!(!item.has_session());
+
+        let store = Memory(std::cell::RefCell::new(Some(session)));
+        let slot = ParkedView::new(&store, Some(seed("old@example.invalid")));
+        slot.save(&parked).unwrap();
+        assert!(store.0.borrow().as_ref().unwrap().has_session());
+    }
+
+    #[test]
+    fn signing_out_ends_every_way_back_in_without_a_person() {
+        let mut item = Credentials {
+            password: Some("dummy-password".into()),
+            access_token: Some("dummy-access".into()),
+            refresh_token: Some("dummy-refresh".into()),
+            expires_at: Some(1),
+            pending: Some(ParkedLogin::new("dummy-session", 1)),
+            ..Credentials::default()
+        };
+        item.sign_out();
+        assert!(!item.has_session() && !item.renewable());
+        assert!(item.pending.is_none());
+        assert_eq!(item.password.as_deref(), Some("dummy-password"));
+    }
+
+    #[test]
     fn a_token_response_without_a_lifetime_gets_the_default() {
         let mut item = Credentials::default();
-        item.apply_tokens(tokens(Some("dummy-refresh"), None));
-        let left = item.expires_at.unwrap() - unix_now();
-        assert!((1790..=1800).contains(&left), "{left}");
+        item.apply_tokens(tokens(Some("dummy-refresh"), None), 1_000);
+        assert_eq!(item.expires_at, Some(1_000 + DEFAULT_LIFETIME_SECS));
     }
 
     #[test]
     fn a_wild_lifetime_is_capped() {
         let mut item = Credentials::default();
-        item.apply_tokens(tokens(None, Some(u64::MAX)));
-        assert!(item.expires_at.unwrap() <= unix_now() + MAX_LIFETIME_SECS);
-        assert!(item.expires_at.unwrap() > unix_now());
+        item.apply_tokens(tokens(None, Some(u64::MAX)), 1_000);
+        assert_eq!(item.expires_at, Some(1_000 + MAX_LIFETIME_SECS));
     }
 
     #[test]
@@ -236,7 +297,7 @@ mod tests {
             refresh_token: Some("dummy-old".into()),
             ..Credentials::default()
         };
-        item.apply_tokens(tokens(None, Some(60)));
+        item.apply_tokens(tokens(None, Some(60)), 1_000);
         assert_eq!(item.refresh_token.as_deref(), Some("dummy-old"));
     }
 

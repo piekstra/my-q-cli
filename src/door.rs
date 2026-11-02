@@ -78,7 +78,8 @@ pub struct Device {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct DoorChange {
     pub door: Door,
-    /// False when the door was already in the requested state: no command was sent.
+    /// False when no command was sent: the door was already in the requested state,
+    /// or already moving toward it.
     pub changed: bool,
     /// True when a read-back showed the requested state.
     pub confirmed: bool,

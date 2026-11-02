@@ -117,7 +117,8 @@ const fn door_description(command: DoorCommand) -> &'static str {
             "Physically opens one garage door, exposing the house. Use it only when the user asked \
              to open this door now, and call myq_doors first if the door's name is unclear. Takes \
              the door by name or serial. Returns door (name, state, online, serial, last_update) as \
-             read back afterwards, changed (false when it was already open, so nothing was sent) \
+             read back afterwards, changed (false when no command was sent because it was already \
+             open or opening) \
              and confirmed (true when a read-back showed it open). A door that never reaches the \
              target state within 45 seconds is an error."
         }
@@ -125,8 +126,8 @@ const fn door_description(command: DoorCommand) -> &'static str {
             "Physically closes one garage door, which moves it toward anything in its path. Use it \
              only when the user asked to close this door now, and call myq_doors first if the \
              door's name is unclear. Takes the door by name or serial. Returns door (name, state, \
-             online, serial, last_update) as read back afterwards, changed (false when it was \
-             already closed, so nothing was sent) and confirmed (true when a read-back showed it \
+             online, serial, last_update) as read back afterwards, changed (false when no command \
+             was sent because it was already closed or closing) and confirmed (true when a read-back showed it \
              closed). A door that never reaches the target state within 45 seconds is an error."
         }
     }

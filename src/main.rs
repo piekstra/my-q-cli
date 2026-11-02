@@ -20,7 +20,7 @@ use myq::client::{self, unix_now, Client, Wait, POLL_INTERVAL};
 use myq::config::Config;
 use myq::credential::{Credentials, KeychainStore, TokenStore, ENV_EMAIL};
 use myq::door::{DoorChange, DoorCommand};
-use myq::signin::{self, Prompting};
+use myq::signin::{self, Prompting, Started};
 use myq::{hub, mcp, BIN, VERSION};
 
 const REPO: &str = "piekstra/my-q-cli";
@@ -416,12 +416,9 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
                 } else {
                     let transport = BlockingTransport::new()?;
                     let started =
-                        signin::start(&transport, &keychain, &email, password.expose(), prompting);
-                    if let Err(err) = started {
-                        // A sign-in parked on its code finishes in a later run.
-                        if keychain.load()?.is_some_and(|c| c.pending.is_some()) {
-                            save_config()?;
-                        }
+                        signin::start(&transport, &keychain, &email, password.expose(), prompting)?;
+                    if let Started::WaitingOnCode(err) = started {
+                        save_config()?;
                         return Err(err);
                     }
                 }
@@ -454,10 +451,7 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
                 keychain.delete()?;
                 store.clear()?;
             } else if let Some(mut credentials) = keychain.load()? {
-                credentials.access_token = None;
-                credentials.refresh_token = None;
-                credentials.expires_at = None;
-                credentials.pending = None;
+                credentials.sign_out();
                 keychain.save(&credentials)?;
             }
             if !cli.common.quiet {
