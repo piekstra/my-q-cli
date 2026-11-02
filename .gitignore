@@ -1,0 +1,9 @@
+/target
+.twapp-*
+__pycache__/
+# Raw captures and pulled APKs live outside the repo (~/.local/share/my-q-cli)
+# and never enter it. Only scrubbed fixtures under tests/fixtures are tracked.
+/captures
+*.flow
+*.apk
+*.pem
