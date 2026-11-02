@@ -1,0 +1,30 @@
+{
+  "uuid": "00000000000000000000000000000000",
+  "interface": "station",
+  "prov": { "types": ["marvell", "wps"] },
+  "connection": {
+    "station": {
+      "mac_addr": "00-00-5E-00-53-01",
+      "configured": 1,
+      "status": 2,
+      "ssid": "DummyNetwork",
+      "bssid": "00:00:5e:00:53:02",
+      "channel": 6,
+      "security": 5,
+      "rssi": -40,
+      "ip": {
+        "ipv4": {
+          "iptype": 1,
+          "ipaddr": "192.0.2.10",
+          "ipmask": "255.255.255.0",
+          "ipgw": "192.0.2.1",
+          "ipdns1": "192.0.2.1",
+          "ipdns2": "0.0.0.0"
+        },
+        "ipv6": [
+          { "scope": "Link-Local", "ipaddr": "FE80::1" }
+        ]
+      }
+    }
+  }
+}

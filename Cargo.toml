@@ -1,0 +1,50 @@
+[package]
+name = "my-q-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Garage door control for your own myQ account, from the command line and from MCP clients. Unofficial."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/piekstra/my-q-cli"
+homepage = "https://github.com/piekstra/my-q-cli"
+readme = "README.md"
+keywords = ["myq", "garage-door", "smart-home", "cli", "mcp"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "myq"
+path = "src/lib.rs"
+
+[[bin]]
+name = "myq"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+schemars = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+pk-cli-core = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0", features = ["reqwest"] }
+pk-cli-secrets = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
+pk-cli-config = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
+pk-cli-selfupdate = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
+pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
+pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0", features = ["stdio"] }
+pk-cli-scrape = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
+# PKCE for the sign-in flow.
+sha2 = "0.11"
+base64 = "0.23"
+getrandom = "0.3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0", features = ["test-util"] }
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
