@@ -27,6 +27,15 @@ impl DoorCommand {
             DoorCommand::Close => "closed",
         }
     }
+
+    /// The `door_state` of a door already on its way to the target. Some openers
+    /// take a second command as stop or reverse, so one is never sent over this.
+    pub fn moving(self) -> &'static str {
+        match self {
+            DoorCommand::Open => "opening",
+            DoorCommand::Close => "closing",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

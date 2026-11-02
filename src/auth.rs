@@ -6,13 +6,11 @@
 //! and because the last redirect goes to the app's custom scheme, which is the
 //! only place the authorization code ever appears.
 
-use std::cell::{Cell, RefCell};
 use std::fmt;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use pk_cli_auth::otp::{CodeSent, OtpCode, OtpLogin, OtpTransport};
 use pk_cli_core::transport::{percent_encode, HttpRequest, HttpResponse, Transport};
-use pk_cli_core::{block_on, CliError};
+use pk_cli_core::CliError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -464,9 +462,9 @@ pub struct Pending {
     field: String,
     fields: Vec<(String, String)>,
     #[serde(skip)]
-    channel: Option<String>,
+    pub channel: Option<String>,
     #[serde(skip)]
-    sent_to_hint: Option<String>,
+    pub sent_to_hint: Option<String>,
 }
 
 impl fmt::Debug for Pending {
@@ -571,93 +569,6 @@ pub async fn redeem<T: Transport>(
     }
 }
 
-/// The provider side of `auth login` for the shared one-time-code flow.
-pub struct SignIn<'a, T> {
-    transport: &'a T,
-    login: Option<(&'a str, &'a str)>,
-    signed_without_code: RefCell<Option<Tokens>>,
-    reached_code_step: Cell<bool>,
-}
-
-impl<'a, T: Transport> SignIn<'a, T> {
-    /// A sign-in starting from the email and password.
-    pub fn start(transport: &'a T, email: &'a str, password: &'a str) -> Self {
-        Self {
-            transport,
-            login: Some((email, password)),
-            signed_without_code: RefCell::new(None),
-            reached_code_step: Cell::new(false),
-        }
-    }
-
-    /// Finishing a parked sign-in, which needs only the code.
-    pub fn resume(transport: &'a T) -> Self {
-        Self {
-            transport,
-            login: None,
-            signed_without_code: RefCell::new(None),
-            reached_code_step: Cell::new(false),
-        }
-    }
-
-    pub fn reached_code_step(&self) -> bool {
-        self.reached_code_step.get()
-    }
-
-    /// The tokens, and whether this login needs a code to sign in. The shared
-    /// flow has no outcome for "signed in without a code": `request_code` ends it
-    /// with an error and leaves the tokens here for this to pick up.
-    pub fn finish(
-        &self,
-        flow: &OtpLogin<'_, Self>,
-        code: Option<&OtpCode>,
-    ) -> Result<(Tokens, bool), CliError> {
-        match flow.login(code) {
-            Ok(tokens) => Ok((tokens, true)),
-            Err(err) => match self.signed_without_code.borrow_mut().take() {
-                Some(tokens) => Ok((tokens, false)),
-                None => Err(err),
-            },
-        }
-    }
-}
-
-impl<T: Transport> OtpTransport for SignIn<'_, T> {
-    type Session = Tokens;
-
-    fn request_code(&self) -> Result<CodeSent, CliError> {
-        let (email, password) = self
-            .login
-            .ok_or_else(|| CliError::Other("a resumed sign-in cannot request a code".into()))?;
-        let pkce = Pkce::generate()?;
-        match block_on(begin(self.transport, email, password, &pkce))? {
-            Begun::Signed(tokens) => {
-                *self.signed_without_code.borrow_mut() = Some(tokens);
-                Err(CliError::Other("signed in without a code".into()))
-            }
-            Begun::Code(pending) => {
-                self.reached_code_step.set(true);
-                let in_flight = serde_json::to_string(&pending)
-                    .map_err(|e| CliError::Other(format!("parking the sign-in: {e}")))?;
-                let mut sent = CodeSent::new(in_flight);
-                sent.channel = pending.channel;
-                sent.sent_to_hint = pending.sent_to_hint;
-                Ok(sent)
-            }
-        }
-    }
-
-    fn redeem(&self, in_flight: &str, code: &OtpCode) -> Result<Tokens, CliError> {
-        let pending: Pending = serde_json::from_str(in_flight).map_err(|_| {
-            CliError::Auth(format!(
-                "the waiting sign-in could not be read; run `{} auth login` for a new code",
-                crate::BIN
-            ))
-        })?;
-        block_on(redeem(self.transport, &pending, code.expose()))
-    }
-}
-
 async fn token_request<T: Transport>(
     transport: &T,
     body: String,
@@ -754,7 +665,7 @@ pub async fn refresh<T: Transport>(transport: &T, refresh_token: &str) -> Result
 mod tests {
     use super::*;
     use crate::client::testing::{header_of, Scripted};
-    use pk_cli_auth::otp::{MemorySlot, ParkingSlot};
+    use pk_cli_core::block_on;
 
     const LOGIN_PAGE: &str = include_str!("../tests/fixtures/login_page.html");
     const CODE_STEP: &str = include_str!("../tests/fixtures/code_step.html");
@@ -876,48 +787,6 @@ mod tests {
         assert_eq!(err.exit_code(), 3);
         assert!(err.to_string().contains("refused"), "{err}");
         assert!(!err.to_string().contains("123456"));
-    }
-
-    #[test]
-    fn the_shared_flow_parks_the_sign_in_and_resumes_it_with_the_code() {
-        let scripted = Scripted::new(to_code_step());
-        let slot = MemorySlot::default();
-        let signin = SignIn::start(&scripted, "dummy@example.invalid", "dummy-pass");
-        let flow = OtpLogin::new("myq", &signin, &slot).quiet(true);
-        let err = signin.finish(&flow, None).unwrap_err();
-        assert_eq!(err.exit_code(), 3);
-        assert!(err.to_string().contains("--code"), "{err}");
-        assert!(signin.reached_code_step());
-        let parked = slot.load().unwrap().expect("parked");
-        assert_eq!(parked.sent_to_hint.as_deref(), Some("d***@example.com"));
-
-        let scripted = Scripted::new(vec![
-            redirect("com.myqops://android?code=dummycode"),
-            HttpResponse::new(200, TOKEN),
-        ]);
-        let signin = SignIn::resume(&scripted);
-        let flow = OtpLogin::new("myq", &signin, &slot).quiet(true);
-        let code = OtpCode::parse("123456").unwrap();
-        let (tokens, code_required) = signin.finish(&flow, Some(&code)).unwrap();
-        assert_eq!(tokens.access_token, "dummy-access-token");
-        assert!(code_required);
-        assert!(slot.load().unwrap().is_none(), "cleared on success");
-    }
-
-    #[test]
-    fn signing_in_without_a_code_is_a_success_and_parks_nothing() {
-        let scripted = Scripted::new(vec![
-            redirect("/Account/Login?ReturnUrl=x"),
-            HttpResponse::new(200, LOGIN_PAGE),
-            redirect("com.myqops://android?code=dummycode"),
-            HttpResponse::new(200, TOKEN),
-        ]);
-        let slot = MemorySlot::default();
-        let signin = SignIn::start(&scripted, "dummy@example.invalid", "dummy-pass");
-        let flow = OtpLogin::new("myq", &signin, &slot).quiet(true);
-        let (_, code_required) = signin.finish(&flow, None).unwrap();
-        assert!(!code_required);
-        assert!(slot.load().unwrap().is_none());
     }
 
     #[test]

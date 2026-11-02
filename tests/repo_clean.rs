@@ -5,12 +5,20 @@
 use std::process::Command;
 
 fn tracked_files() -> Vec<String> {
-    let out = Command::new("git").args(["ls-files"]).output();
-    let Ok(out) = out else { return Vec::new() };
-    String::from_utf8_lossy(&out.stdout)
+    let out = Command::new("git")
+        .args(["ls-files"])
+        .output()
+        .expect("git runs, or this guard checks nothing");
+    assert!(out.status.success(), "git ls-files failed");
+    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(str::to_string)
-        .collect()
+        .collect();
+    assert!(
+        !files.is_empty(),
+        "git tracks no files, so nothing is checked"
+    );
+    files
 }
 
 fn private_ipv4(text: &str) -> Vec<String> {

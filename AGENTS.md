@@ -18,13 +18,18 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
   account. Never put a sign-in in a loop or a retry. After a failure, diagnose first.
 - **The repo carries no personal data.** Runtime output may; tracked files may not.
   `tests/repo_clean.rs` enforces shapes. Never commit a raw capture or an APK.
-- **Tests are offline** and never touch a real keychain item.
+- **Tests are offline** and never touch a real keychain item. Set `MYQ_TEST_KEYCHAIN=1` with
+  `MYQ_KEYCHAIN_SERVICE=<a throwaway name>` to run the two surface tests that read one.
+- **No environment-variable credentials.** The family's spec puts them before the keychain. Here a session
+  must keep rotated tokens and what myQ said about the password, or every process would post the password
+  again. `MYQ_EMAIL` and `auth login --from-env` are sign-in inputs only.
 
 ## Layout
 
 | File | Holds |
 | --- | --- |
-| `src/auth.rs` | The sign-in: PKCE, the form posts, the code step, tokens |
+| `src/auth.rs` | The sign-in's requests: PKCE, the form posts, the code step, tokens |
+| `src/signin.rs` | `auth login`'s sequence: what is parked, stored, and refused |
 | `src/client.rs` | API calls, session renewal, the door command and its read-back |
 | `src/credential.rs` | The one keychain item, and the parked sign-in inside it |
 | `src/door.rs` | DTOs, parsing of API responses, and door-reference resolution |

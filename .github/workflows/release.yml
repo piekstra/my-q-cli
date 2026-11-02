@@ -33,8 +33,24 @@ permissions:
   contents: read
 
 jobs:
+  # First, so a tag that names the wrong version publishes nothing at all.
+  version:
+    name: the tag names the crate's version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
   build:
     name: build ${{ matrix.name }}
+    needs: version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -117,8 +133,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # The manifest's version must be the crate's, and on a tag the tag's,
-      # or Claude Desktop would show one version and run another.
+      # The manifest's version must be the crate's, or Claude Desktop would show
+      # one version and run another.
       - name: Assemble, validate and pack
         run: |
           set -euo pipefail
@@ -126,10 +142,6 @@ jobs:
           manifest_version=$(jq -r .version packaging/mcpb/manifest.json)
           if [ "$manifest_version" != "$version" ]; then
             echo "packaging/mcpb/manifest.json is $manifest_version but Cargo.toml is $version" >&2
-            exit 1
-          fi
-          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
-            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $version" >&2
             exit 1
           fi
           stage="$RUNNER_TEMP/myq"
@@ -155,8 +167,8 @@ jobs:
   # queue still leaves the Linux and Windows tarballs on the release.
   publish:
     name: attach to the release
-    needs: [build, mcpb]
-    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    needs: [version, build, mcpb]
+    if: ${{ !cancelled() && needs.version.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write

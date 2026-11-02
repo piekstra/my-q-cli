@@ -153,11 +153,9 @@ impl<S: Source> Toolset for MyqTools<S> {
             .input::<DoorsArgs>()
             .output::<Page<DoorItem>>(),
             ToolDef::write(OPEN, "Open a garage door", door_description(DoorCommand::Open), true)
-                .idempotent(true)
                 .input::<DoorArgs>()
                 .output::<DoorChange>(),
             ToolDef::write(CLOSE, "Close a garage door", door_description(DoorCommand::Close), true)
-                .idempotent(true)
                 .input::<DoorArgs>()
                 .output::<DoorChange>(),
         ]

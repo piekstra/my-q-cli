@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use pk_cli_auth::otp::{CodeArgs, OtpLogin};
+use pk_cli_auth::otp::CodeArgs;
 use pk_cli_auth::{AuthMethod, AuthStatus, LoginArgs, LogoutArgs, SetCredentialArgs};
 use pk_cli_config::ConfigStore;
 use pk_cli_core::info::{AuthInfo, CliInfo};
@@ -15,11 +15,12 @@ use pk_cli_secrets::{OnePassword, OpArgs, OpRef, Secret};
 use pk_cli_selfupdate::{SelfUpdateArgs, Updater};
 use serde_json::{json, Value};
 
-use myq::auth::{self, SignIn};
+use myq::auth;
 use myq::client::{self, unix_now, Client, Wait, POLL_INTERVAL};
 use myq::config::Config;
-use myq::credential::{Credentials, KeychainStore, ParkedView, TokenStore, ENV_EMAIL};
+use myq::credential::{Credentials, KeychainStore, TokenStore, ENV_EMAIL};
 use myq::door::{DoorChange, DoorCommand};
+use myq::signin::{self, Prompting};
 use myq::{hub, mcp, BIN, VERSION};
 
 const REPO: &str = "piekstra/my-q-cli";
@@ -365,9 +366,10 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
             code,
         }) => {
             let code = code.resolve()?;
-            let interactive = cli.common.interactive() && !login.non_interactive;
-            let transport = BlockingTransport::new()?;
-            let mut credentials;
+            let prompting = Prompting {
+                interactive: cli.common.interactive() && !login.non_interactive,
+                quiet: cli.common.quiet,
+            };
             if let Some(code) = &code {
                 if login.source.stdin
                     || login.source.from_env.is_some()
@@ -382,41 +384,21 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
                             .into(),
                     ));
                 }
-                let signin = SignIn::resume(&transport);
-                let slot = ParkedView::new(&keychain, None);
-                let flow = OtpLogin::new(BIN, &signin, &slot)
-                    .interactive(interactive)
-                    .quiet(cli.common.quiet);
-                let (tokens, code_required) = signin.finish(&flow, Some(code))?;
-                credentials = keychain.load_item()?.unwrap_or_default();
-                store_tokens(&mut credentials, tokens, code_required);
+                signin::resume(&BlockingTransport::new()?, &keychain, code, prompting)?;
             } else {
                 let email_ref = email_op.as_ref().or(cfg.op_email_ref.as_ref());
                 let use_ref = if email.is_some() { None } else { email_ref };
                 let email = resolve_email(email.as_deref(), use_ref, &cfg)?;
-                let existing = keychain.load_item()?;
-                let in_the_way = if login.no_verify {
-                    existing.is_some()
-                } else {
-                    existing
-                        .as_ref()
-                        .is_some_and(|c| c.access_token.is_some() || c.refresh_token.is_some())
-                };
-                if in_the_way && !login.overwrite {
-                    return Err(CliError::Usage(
-                        "a credential is already stored; pass --overwrite to replace it".into(),
-                    ));
-                }
+                signin::check_overwrite(
+                    keychain.load()?.as_ref(),
+                    login.no_verify,
+                    login.overwrite,
+                )?;
                 let prompt = (!login.non_interactive).then_some("myQ password");
                 let password = read_password(&login.source, op, &cfg, prompt)?;
-                credentials = Credentials {
-                    email: email.clone(),
-                    password: Some(password.expose().to_string()),
-                    ..Credentials::default()
-                };
-                let save_config = |email: &str| -> Result<(), CliError> {
+                let save_config = || -> Result<(), CliError> {
                     let mut saved: Config = store.load()?;
-                    saved.email = Some(email.to_string());
+                    saved.email = Some(email.clone());
                     if let Some(reference) = email_op {
                         saved.op_email_ref = Some(reference.clone());
                     }
@@ -425,27 +407,26 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
                     }
                     store.save(&saved)
                 };
-                if !login.no_verify {
-                    let signin = SignIn::start(&transport, &email, password.expose());
-                    let slot = ParkedView::new(&keychain, Some(credentials.clone()));
-                    let flow = OtpLogin::new(BIN, &signin, &slot)
-                        .interactive(interactive)
-                        .quiet(cli.common.quiet);
-                    let (tokens, code_required) = match signin.finish(&flow, None) {
-                        Ok(done) => done,
-                        Err(err) => {
-                            // A sign-in parked on its code finishes in a later run.
-                            if signin.reached_code_step() {
-                                save_config(&email)?;
-                            }
-                            return Err(err);
+                if login.no_verify {
+                    keychain.save(&Credentials {
+                        email: email.clone(),
+                        password: Some(password.expose().to_string()),
+                        ..Credentials::default()
+                    })?;
+                } else {
+                    let transport = BlockingTransport::new()?;
+                    let started =
+                        signin::start(&transport, &keychain, &email, password.expose(), prompting);
+                    if let Err(err) = started {
+                        // A sign-in parked on its code finishes in a later run.
+                        if keychain.load()?.is_some_and(|c| c.pending.is_some()) {
+                            save_config()?;
                         }
-                    };
-                    store_tokens(&mut credentials, tokens, code_required);
+                        return Err(err);
+                    }
                 }
-                save_config(&email)?;
+                save_config()?;
             }
-            keychain.save(&credentials)?;
             let saved: Config = store.load()?;
             if !cli.common.quiet {
                 eprintln!(
@@ -461,7 +442,8 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
             Ok(())
         }
         AuthCmd::Status => {
-            if !cli.common.quiet && keychain.load_item()?.is_some_and(|c| c.pending.is_some()) {
+            let waiting = keychain.load()?.is_some_and(|c| c.pending.is_some());
+            if waiting && !cli.common.quiet {
                 eprintln!("a sign-in is waiting for its code: `{BIN} auth login --code <CODE>`");
             }
             status_of(&keychain, &cfg)?.emit(json);
@@ -471,7 +453,7 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
             if args.forget {
                 keychain.delete()?;
                 store.clear()?;
-            } else if let Some(mut credentials) = keychain.load_item()? {
+            } else if let Some(mut credentials) = keychain.load()? {
                 credentials.access_token = None;
                 credentials.refresh_token = None;
                 credentials.expires_at = None;
@@ -485,7 +467,7 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
         }
         AuthCmd::SetCredential(SetCredentialCmd { args, op, email }) => {
             let email = resolve_email(email.as_deref(), None, &cfg)?;
-            let existing = keychain.load_item()?;
+            let existing = keychain.load()?;
             if existing.is_some() && !args.overwrite {
                 return Err(CliError::Usage(
                     "a credential is already stored; pass --overwrite to replace it".into(),
@@ -505,27 +487,13 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
     }
 }
 
-fn store_tokens(credentials: &mut Credentials, tokens: auth::Tokens, code_required: bool) {
-    credentials.access_token = Some(tokens.access_token);
-    credentials.refresh_token = tokens.refresh_token;
-    credentials.expires_at = tokens.expires_in.map(|s| unix_now() + s);
-    credentials.code_required = code_required;
-    credentials.pending = None;
-}
-
 fn status_of(keychain: &KeychainStore, cfg: &Config) -> Result<AuthStatus, CliError> {
-    let from_env = KeychainStore::from_env();
-    let item = if from_env.is_some() {
-        None
-    } else {
-        keychain.load_item()?
-    };
-    let credentials = from_env.as_ref().or(item.as_ref());
+    let item = keychain.load()?;
+    let credentials = item.as_ref();
     let live = credentials
         .and_then(|c| c.expires_at.filter(|_| c.access_token.is_some()))
         .is_some_and(|at| at > unix_now());
-    let renewable = credentials
-        .is_some_and(|c| c.refresh_token.is_some() || (c.password.is_some() && !c.code_required));
+    let renewable = credentials.is_some_and(Credentials::renewable);
     let mut status = AuthStatus::new(true, live || renewable, AuthMethod::Password);
     status.username = credentials
         .map(|c| c.email.clone())

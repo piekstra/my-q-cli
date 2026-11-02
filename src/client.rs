@@ -19,10 +19,10 @@ pub const API_VERSION: &str = "v6.0";
 
 /// Renew this long before the token runs out, so no request races its expiry.
 const EXPIRY_MARGIN_SECS: u64 = 60;
-const DEFAULT_LIFETIME_SECS: u64 = 1800;
 pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Refresh tokens rotate, so two parallel MCP calls must not spend the same one.
+/// Refresh tokens may rotate, so two parallel MCP calls must not spend the same one.
+/// Another process can still spend it first, which `renew` checks for.
 static RENEWAL: Mutex<()> = Mutex::new(());
 
 pub fn unix_now() -> u64 {
@@ -64,15 +64,17 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
     }
 
     fn apply(&self, mut credentials: Credentials, tokens: Tokens) -> Result<String, CliError> {
-        let access = tokens.access_token;
-        credentials.access_token = Some(access.clone());
-        if tokens.refresh_token.is_some() {
-            credentials.refresh_token = tokens.refresh_token;
-        }
-        let lifetime = tokens.expires_in.unwrap_or(DEFAULT_LIFETIME_SECS);
-        credentials.expires_at = Some(unix_now() + lifetime);
+        let access = tokens.access_token.clone();
+        credentials.apply_tokens(tokens);
         self.store.save(&credentials)?;
         Ok(access)
+    }
+
+    /// Stop posting this password. A person has to sign in, and more posts could
+    /// only send more codes or walk the account toward a lockout.
+    fn block_password(&self, mut credentials: Credentials) -> Result<(), CliError> {
+        credentials.password_blocked = true;
+        self.store.save(&credentials)
     }
 
     /// Refresh, then fall back to the stored password when the refresh token is finished.
@@ -80,12 +82,27 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
         let password = credentials
             .password
             .clone()
-            .filter(|_| self.password_sign_in && !credentials.code_required);
+            .filter(|_| self.password_sign_in && !credentials.password_blocked);
         if let Some(token) = credentials.refresh_token.clone() {
             match auth::refresh(&self.transport, &token).await {
                 Ok(tokens) => return self.apply(credentials, tokens),
-                Err(CliError::Auth(_)) if password.is_some() => {}
-                Err(CliError::Auth(_)) => return Err(sign_in_needed()),
+                Err(CliError::Auth(reason)) => {
+                    // A CLI command and a running MCP server are separate processes.
+                    // If the other one spent this token, its replacement is saved.
+                    if let Some(latest) = self.store.load()? {
+                        if latest.refresh_token.as_deref() != Some(token.as_str()) {
+                            if let Some(access) = live_access(&latest) {
+                                return Ok(access);
+                            }
+                        }
+                    }
+                    if password.is_none() {
+                        return Err(CliError::Auth(format!(
+                            "{reason}; run `{} auth login`",
+                            crate::BIN
+                        )));
+                    }
+                }
                 Err(other) => return Err(other),
             }
         }
@@ -93,16 +110,17 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
             return Err(sign_in_needed());
         };
         let pkce = Pkce::generate()?;
-        match auth::begin(&self.transport, &credentials.email, &password, &pkce).await? {
-            Begun::Signed(tokens) => self.apply(credentials, tokens),
-            // Only a person can answer this. Remembering it stops a later read or
-            // MCP call from making myQ send another code.
-            Begun::Code(_) => {
-                let mut credentials = credentials;
-                credentials.code_required = true;
-                self.store.save(&credentials)?;
+        match auth::begin(&self.transport, &credentials.email, &password, &pkce).await {
+            Ok(Begun::Signed(tokens)) => self.apply(credentials, tokens),
+            Ok(Begun::Code(_)) => {
+                self.block_password(credentials)?;
                 Err(sign_in_needed())
             }
+            Err(err @ CliError::Auth(_)) => {
+                self.block_password(credentials)?;
+                Err(err)
+            }
+            Err(other) => Err(other),
         }
     }
 
@@ -115,12 +133,9 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
         }
         let _renewing = RENEWAL.lock().unwrap_or_else(|e| e.into_inner());
         let credentials = self.store.load()?.ok_or_else(sign_in_needed)?;
-        let still_good = credentials
-            .expires_at
-            .is_some_and(|at| at > unix_now() + EXPIRY_MARGIN_SECS);
-        let token = match credentials.access_token.clone() {
+        let token = match live_access(&credentials) {
             // A parallel call may already have renewed what this one saw rejected.
-            Some(token) if still_good && stale != Some(token.as_str()) => token,
+            Some(token) if stale != Some(token.as_str()) => token,
             _ => self.renew(credentials).await?,
         };
         *self.cached.borrow_mut() = Some(token.clone());
@@ -208,8 +223,9 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
         check(&response, "the door command")
     }
 
-    /// Move a door and report what a read-back shows. `pause` waits between
-    /// reads; `wait.timeout` of zero sends the command and reads once.
+    /// Move a door and report what a read-back shows. `pause` waits between reads;
+    /// `wait.timeout` of zero sends the command and reads once. A door already on its
+    /// way to the target gets no second command, and is only watched.
     pub async fn set_door(
         &self,
         account: &str,
@@ -227,15 +243,17 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
                 confirmed: true,
             });
         }
-        if door.online == Some(false) {
-            return Err(CliError::Upstream(format!(
-                "`{}` is offline, so myQ cannot move it",
-                door.name
-            )));
+        if door.state != command.moving() {
+            if door.online == Some(false) {
+                return Err(CliError::Upstream(format!(
+                    "`{}` is offline, so myQ cannot move it",
+                    door.name
+                )));
+            }
+            self.door_command(account, &door.serial, command).await?;
         }
-        self.door_command(account, &door.serial, command).await?;
 
-        let polls = wait.timeout.as_secs() / wait.interval.as_secs().max(1);
+        let name = door.name.clone();
         let read = |door: Door| async move {
             let doors = self.doors(account).await?;
             let read_back = doors.into_iter().find(|d| d.serial == door.serial);
@@ -243,17 +261,22 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
                 CliError::Upstream(format!("`{}` vanished from myQ's device list", door.name))
             })
         };
-        if polls == 0 {
+        if wait.timeout.is_zero() {
             return Ok(DoorChange {
-                door: read(door).await?,
+                door: read(door).await.map_err(|e| unconfirmed(&name, e))?,
                 changed: true,
                 confirmed: false,
             });
         }
+        let polls = wait
+            .timeout
+            .as_secs()
+            .div_ceil(wait.interval.as_secs().max(1))
+            .max(1);
         let mut latest = door;
         for _ in 0..polls {
             pause(wait.interval);
-            latest = read(latest).await?;
+            latest = read(latest).await.map_err(|e| unconfirmed(&name, e))?;
             if latest.state == command.target() {
                 return Ok(DoorChange {
                     door: latest,
@@ -296,6 +319,28 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
     }
 }
 
+fn live_access(credentials: &Credentials) -> Option<String> {
+    let live = credentials
+        .expires_at
+        .is_some_and(|at| at > unix_now() + EXPIRY_MARGIN_SECS);
+    credentials.access_token.clone().filter(|_| live)
+}
+
+/// A read-back that failed after the command went out: the door may be moving, and
+/// saying only that a read failed would invite sending the command again.
+fn unconfirmed(name: &str, err: CliError) -> CliError {
+    let text = format!(
+        "myQ accepted the command, so `{name}` may be moving, but reading it back failed: {err}. \
+         Check the door before sending it again"
+    );
+    match err {
+        CliError::Auth(_) => CliError::Auth(text),
+        CliError::NotFound(_) => CliError::NotFound(text),
+        CliError::Keychain(_) => CliError::Keychain(text),
+        _ => CliError::Upstream(text),
+    }
+}
+
 fn sign_in_needed() -> CliError {
     CliError::Auth("not signed in to myQ; run `myq auth login`".into())
 }
@@ -307,13 +352,21 @@ fn signed(request: HttpRequest, token: &str) -> HttpRequest {
         .header("Authorization", format!("Bearer {token}"))
 }
 
-/// Refuses a URL whose host is not `myq-cloud.com` or under it, label by label.
+/// Refuses any URL that would not reach `myq-cloud.com` or a host under it, over
+/// https with no credentials in the URL. It parses with the `url` crate because
+/// reqwest does: `\\` ends a host there, so splitting by hand can disagree with where
+/// the request actually goes.
 pub fn ensure_myq_host(url: &str) -> Result<(), CliError> {
-    let host = url
-        .strip_prefix("https://")
-        .and_then(|rest| rest.split(['/', '?', '#']).next())
-        .unwrap_or("");
-    if host == "myq-cloud.com" || host.ends_with(".myq-cloud.com") {
+    let allowed = url::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url
+                .host_str()
+                .is_some_and(|host| host == "myq-cloud.com" || host.ends_with(".myq-cloud.com"))
+    });
+    if allowed {
         return Ok(());
     }
     Err(CliError::Usage(
@@ -552,7 +605,7 @@ mod tests {
     fn a_dead_session_on_a_code_login_never_sends_the_password() {
         let scripted = Scripted::new(vec![HttpResponse::new(400, r#"{"error":"invalid_grant"}"#)]);
         let store = expired();
-        store.0.borrow_mut().as_mut().unwrap().code_required = true;
+        store.0.borrow_mut().as_mut().unwrap().password_blocked = true;
         let client = Client::new(&scripted, &store);
         let err = block_on(client.doors(ACCOUNT)).unwrap_err();
         assert_eq!(err.exit_code(), 3);
@@ -587,12 +640,89 @@ mod tests {
         let client = Client::new(&scripted, &store);
         let err = block_on(client.doors(ACCOUNT)).unwrap_err();
         assert_eq!(err.exit_code(), 3);
-        assert!(store.0.borrow().as_ref().unwrap().code_required);
+        assert!(store.0.borrow().as_ref().unwrap().password_blocked);
 
         let scripted = Scripted::new(vec![HttpResponse::new(400, r#"{"error":"invalid_grant"}"#)]);
         let client = Client::new(&scripted, &store);
         block_on(client.doors(ACCOUNT)).unwrap_err();
         assert_eq!(scripted.sent().len(), 1, "the password is not tried again");
+    }
+
+    #[test]
+    fn a_refused_stored_password_is_posted_once() {
+        let login_page = include_str!("../tests/fixtures/login_page.html");
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+            HttpResponse::new(200, login_page),
+            HttpResponse::new(200, login_page),
+        ]);
+        let store = expired();
+        let client = Client::new(&scripted, &store);
+        let err = block_on(client.doors(ACCOUNT)).unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("lock the account"), "{err}");
+        assert!(store.0.borrow().as_ref().unwrap().password_blocked);
+
+        let scripted = Scripted::new(vec![HttpResponse::new(400, r#"{"error":"invalid_grant"}"#)]);
+        let client = Client::new(&scripted, &store);
+        block_on(client.doors(ACCOUNT)).unwrap_err();
+        assert_eq!(scripted.sent().len(), 1, "the password is not tried again");
+    }
+
+    #[test]
+    fn an_outage_during_the_password_post_does_not_block_the_password() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+            HttpResponse::new(503, ""),
+        ]);
+        let store = expired();
+        let client = Client::new(&scripted, &store);
+        assert_eq!(block_on(client.doors(ACCOUNT)).unwrap_err().exit_code(), 5);
+        assert!(!store.0.borrow().as_ref().unwrap().password_blocked);
+    }
+
+    /// The first load is what `bearer` read. Then the other process rotates the token.
+    struct RotatedElsewhere {
+        store: Memory,
+        loads: std::cell::Cell<u32>,
+    }
+
+    impl TokenStore for RotatedElsewhere {
+        fn load(&self) -> Result<Option<Credentials>, CliError> {
+            self.loads.set(self.loads.get() + 1);
+            let mut item = self.store.load()?;
+            if self.loads.get() > 1 {
+                if let Some(item) = item.as_mut() {
+                    item.access_token = Some("dummy-from-the-other-process".into());
+                    item.refresh_token = Some("dummy-rotated".into());
+                    item.expires_at = Some(unix_now() + 3600);
+                }
+            }
+            Ok(item)
+        }
+        fn save(&self, credentials: &Credentials) -> Result<(), CliError> {
+            self.store.save(credentials)
+        }
+    }
+
+    #[test]
+    fn a_token_another_process_rotated_is_picked_up_rather_than_signing_in() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+            HttpResponse::new(200, DEVICES_JSON),
+        ]);
+        let store = RotatedElsewhere {
+            store: expired(),
+            loads: std::cell::Cell::new(0),
+        };
+        let client = Client::new(&scripted, store);
+        block_on(client.doors(ACCOUNT)).unwrap();
+        let sent = scripted.sent();
+        assert_eq!(sent.len(), 2, "no password post");
+        assert_eq!(
+            header_of(&sent[1], "authorization").as_deref(),
+            Some("Bearer dummy-from-the-other-process")
+        );
     }
 
     #[test]
@@ -713,6 +843,80 @@ mod tests {
     }
 
     #[test]
+    fn a_timeout_shorter_than_the_interval_still_waits_for_the_door() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(200, DEVICES_JSON),
+            HttpResponse::new(204, ""),
+            devices_with_left("open"),
+        ]);
+        let client = Client::new(&scripted, signed_in());
+        let short = Wait {
+            timeout: Duration::from_secs(1),
+            interval: POLL_INTERVAL,
+        };
+        let change =
+            block_on(client.set_door(ACCOUNT, "left", DoorCommand::Open, short, &|_| {})).unwrap();
+        assert!(change.changed && change.confirmed);
+    }
+
+    #[test]
+    fn a_door_already_moving_that_way_gets_no_second_command() {
+        let scripted = Scripted::new(vec![
+            devices_with_left("opening"),
+            devices_with_left("open"),
+        ]);
+        let client = Client::new(&scripted, signed_in());
+        let change =
+            block_on(client.set_door(ACCOUNT, "left", DoorCommand::Open, FAST, &|_| {})).unwrap();
+        assert!(change.confirmed);
+        assert!(scripted.sent().iter().all(|r| r.method == "GET"));
+    }
+
+    #[test]
+    fn a_door_moving_the_other_way_still_gets_the_command() {
+        let scripted = Scripted::new(vec![
+            devices_with_left("closing"),
+            HttpResponse::new(204, ""),
+            devices_with_left("open"),
+        ]);
+        let client = Client::new(&scripted, signed_in());
+        block_on(client.set_door(ACCOUNT, "left", DoorCommand::Open, FAST, &|_| {})).unwrap();
+        assert_eq!(scripted.sent()[1].method, "PUT");
+    }
+
+    #[test]
+    fn a_failed_read_back_says_the_command_already_went_out() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(200, DEVICES_JSON),
+            HttpResponse::new(204, ""),
+            HttpResponse::new(503, ""),
+        ]);
+        let client = Client::new(&scripted, signed_in());
+        let err = block_on(client.set_door(ACCOUNT, "left", DoorCommand::Open, FAST, &|_| {}))
+            .unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(text.contains("may be moving"), "{text}");
+        assert!(text.contains("before sending it again"), "{text}");
+    }
+
+    #[test]
+    fn a_read_during_a_parked_sign_in_sends_nothing() {
+        let store = Memory(RefCell::new(Some(Credentials {
+            email: "dummy@example.invalid".into(),
+            password: Some("dummy-password".into()),
+            pending: Some(pk_cli_auth::otp::ParkedLogin::new("dummy-session", 1)),
+            password_blocked: true,
+            ..Credentials::default()
+        })));
+        let scripted = Scripted::new(vec![]);
+        let client = Client::new(&scripted, &store);
+        let err = block_on(client.doors(ACCOUNT)).unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+        assert!(scripted.sent().is_empty());
+    }
+
+    #[test]
     fn the_token_only_goes_to_myq_hosts() {
         for ok in [
             "https://devices.myq-cloud.com/api",
@@ -727,6 +931,10 @@ mod tests {
             "https://notmyq-cloud.com/",
             "https://evil.example/?x=.myq-cloud.com",
             "https://evil.example#.myq-cloud.com",
+            "https://evil.example\\.myq-cloud.com/x",
+            "https://devices.myq-cloud.com@evil.example/x",
+            "https://user:pass@devices.myq-cloud.com/x",
+            "https://devices.myq-cloud.com:8443/x",
             "/api/x",
         ] {
             assert_eq!(ensure_myq_host(bad).unwrap_err().exit_code(), 2, "{bad}");

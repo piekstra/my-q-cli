@@ -14,17 +14,17 @@ build:
 
 release: SIGN_TARGET = target/release/$(BIN)
 release:
-	$(CARGO) build --release
+	$(CARGO) build --release --locked
 	@$(SIGN)
 
 test:
-	$(CARGO) test --all
+	$(CARGO) test --all --locked
 
 capture-test:
 	python3 -m unittest discover -s scripts/capture
 
 lint:
-	$(CARGO) clippy --all-targets -- -D warnings
+	$(CARGO) clippy --all-targets --locked -- -D warnings
 
 fmt:
 	$(CARGO) fmt --all

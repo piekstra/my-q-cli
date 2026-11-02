@@ -34,6 +34,8 @@ pk-cli-auth = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" 
 pk-cli-http = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
 pk-cli-mcp = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0", features = ["stdio"] }
 pk-cli-scrape = { git = "https://github.com/piekstra/cli-common", tag = "v0.15.0" }
+# The same parser reqwest uses, so the token check and the request agree on the host.
+url = "2"
 # PKCE for the sign-in flow.
 sha2 = "0.11"
 base64 = "0.23"

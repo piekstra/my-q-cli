@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from myq_capture import body_shape, flow_record, redact_headers, redact_value  # noqa: E402
 
 DUMMY_PASSWORD = "dummy-password-value"
-DUMMY_JWT = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJkdW1teSJ9.ZHVtbXk"
+DUMMY_JWT = "eyJkdW1teQ.ZHVtbXk.ZHVtbXk"
 
 
 class Redaction(unittest.TestCase):

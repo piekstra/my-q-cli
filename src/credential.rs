@@ -8,9 +8,16 @@ use pk_cli_core::CliError;
 use pk_cli_secrets::CredentialStore;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::Tokens;
+use crate::client::unix_now;
+
+/// What a token response with no `expires_in` is taken to last.
+const DEFAULT_LIFETIME_SECS: u64 = 1800;
+/// A server's `expires_in` is believed up to this, so a wild one cannot overflow.
+const MAX_LIFETIME_SECS: u64 = 365 * 24 * 60 * 60;
+
 pub const KEYCHAIN_ACCOUNT: &str = "credentials";
 pub const ENV_EMAIL: &str = "MYQ_EMAIL";
-pub const ENV_PASSWORD: &str = "MYQ_PASSWORD";
 pub const ENV_KEYCHAIN_SERVICE: &str = "MYQ_KEYCHAIN_SERVICE";
 
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,10 +35,34 @@ pub struct Credentials {
     /// A sign-in waiting on its one-time code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<ParkedLogin>,
-    /// This login needs a one-time code, so the stored password alone cannot sign
-    /// in, and trying would only make myQ send another code.
+    /// Posting the stored password cannot sign in: myQ refused it or answers it with
+    /// a step only a person can finish. Each post can cost a one-time code or count
+    /// toward a lockout, so none is made until `auth login` replaces this item.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub code_required: bool,
+    pub password_blocked: bool,
+}
+
+impl Credentials {
+    pub fn apply_tokens(&mut self, tokens: Tokens) {
+        self.access_token = Some(tokens.access_token);
+        if tokens.refresh_token.is_some() {
+            self.refresh_token = tokens.refresh_token;
+        }
+        let lifetime = tokens
+            .expires_in
+            .unwrap_or(DEFAULT_LIFETIME_SECS)
+            .min(MAX_LIFETIME_SECS);
+        self.expires_at = Some(unix_now().saturating_add(lifetime));
+    }
+
+    pub fn has_session(&self) -> bool {
+        self.access_token.is_some() || self.refresh_token.is_some()
+    }
+
+    /// Whether a session could be renewed without a person.
+    pub fn renewable(&self) -> bool {
+        self.refresh_token.is_some() || (self.password.is_some() && !self.password_blocked)
+    }
 }
 
 impl fmt::Debug for Credentials {
@@ -42,7 +73,7 @@ impl fmt::Debug for Credentials {
             .field("refresh_token", &self.refresh_token.is_some())
             .field("expires_at", &self.expires_at)
             .field("pending", &self.pending.is_some())
-            .field("code_required", &self.code_required)
+            .field("password_blocked", &self.password_blocked)
             .finish()
     }
 }
@@ -88,6 +119,10 @@ impl<S: TokenStore> ParkingSlot for ParkedView<'_, S> {
             item.password = seed.password.clone();
         }
         item.pending = Some(parked.clone());
+        // Reaching a code step proves the password alone cannot sign in. A read
+        // during the wait must not post it, or myQ could send a second code that
+        // does not match the parked session.
+        item.password_blocked = true;
         self.store.save(&item)
     }
 
@@ -101,9 +136,10 @@ impl<S: TokenStore> ParkingSlot for ParkedView<'_, S> {
     }
 }
 
-/// `MYQ_EMAIL` and `MYQ_PASSWORD` first (§1.7: env before keychain), then the
-/// keychain item. In env mode nothing is written: a `.mcpb` runs without a
-/// keychain, and an MCP tool must never create an item.
+/// The keychain item. DESIGN.md §1.7 would put environment variables first; this
+/// CLI reads none. A session has to keep rotated tokens and what myQ said about the
+/// password, or every process would post the password again, and each post can cost
+/// a one-time code. `MYQ_EMAIL` and `auth login --from-env` remain sign-in inputs.
 pub struct KeychainStore {
     store: CredentialStore,
 }
@@ -115,21 +151,6 @@ impl KeychainStore {
             _ => CredentialStore::for_binary(crate::BIN),
         };
         Self { store }
-    }
-
-    pub fn from_env() -> Option<Credentials> {
-        let email = std::env::var(ENV_EMAIL).ok().filter(|v| !v.is_empty())?;
-        let password = std::env::var(ENV_PASSWORD).ok().filter(|v| !v.is_empty())?;
-        Some(Credentials {
-            email,
-            password: Some(password),
-            ..Credentials::default()
-        })
-    }
-
-    /// The keychain item alone, ignoring the environment.
-    pub fn load_item(&self) -> Result<Option<Credentials>, CliError> {
-        self.store.get_json(KEYCHAIN_ACCOUNT)
     }
 
     pub fn delete(&self) -> Result<bool, CliError> {
@@ -145,16 +166,10 @@ impl Default for KeychainStore {
 
 impl TokenStore for KeychainStore {
     fn load(&self) -> Result<Option<Credentials>, CliError> {
-        match Self::from_env() {
-            Some(credentials) => Ok(Some(credentials)),
-            None => self.load_item(),
-        }
+        self.store.get_json(KEYCHAIN_ACCOUNT)
     }
 
     fn save(&self, credentials: &Credentials) -> Result<(), CliError> {
-        if Self::from_env().is_some() {
-            return Ok(());
-        }
         self.store.set_json(KEYCHAIN_ACCOUNT, credentials)
     }
 }
@@ -184,10 +199,58 @@ mod tests {
         let item = store.0.borrow().clone().unwrap();
         assert_eq!(item.email, "dummy@example.invalid");
         assert!(item.pending.is_some());
+        assert!(item.password_blocked, "the password must not be posted now");
         slot.clear().unwrap();
         let item = store.0.borrow().clone().unwrap();
         assert!(item.pending.is_none());
         assert_eq!(item.password.as_deref(), Some("dummy-password"));
+    }
+
+    fn tokens(refresh: Option<&str>, expires_in: Option<u64>) -> Tokens {
+        Tokens {
+            access_token: "dummy-access".into(),
+            refresh_token: refresh.map(str::to_string),
+            expires_in,
+        }
+    }
+
+    #[test]
+    fn a_token_response_without_a_lifetime_gets_the_default() {
+        let mut item = Credentials::default();
+        item.apply_tokens(tokens(Some("dummy-refresh"), None));
+        let left = item.expires_at.unwrap() - unix_now();
+        assert!((1790..=1800).contains(&left), "{left}");
+    }
+
+    #[test]
+    fn a_wild_lifetime_is_capped() {
+        let mut item = Credentials::default();
+        item.apply_tokens(tokens(None, Some(u64::MAX)));
+        assert!(item.expires_at.unwrap() <= unix_now() + MAX_LIFETIME_SECS);
+        assert!(item.expires_at.unwrap() > unix_now());
+    }
+
+    #[test]
+    fn a_response_without_a_refresh_token_keeps_the_old_one() {
+        let mut item = Credentials {
+            refresh_token: Some("dummy-old".into()),
+            ..Credentials::default()
+        };
+        item.apply_tokens(tokens(None, Some(60)));
+        assert_eq!(item.refresh_token.as_deref(), Some("dummy-old"));
+    }
+
+    #[test]
+    fn only_a_usable_way_back_in_counts_as_renewable() {
+        let mut item = Credentials {
+            password: Some("dummy-password".into()),
+            ..Credentials::default()
+        };
+        assert!(item.renewable());
+        item.password_blocked = true;
+        assert!(!item.renewable());
+        item.refresh_token = Some("dummy-refresh".into());
+        assert!(item.renewable());
     }
 
     #[test]

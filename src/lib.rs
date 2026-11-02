@@ -11,6 +11,7 @@ pub mod credential;
 pub mod door;
 pub mod hub;
 pub mod mcp;
+pub mod signin;
 
 pub const BIN: &str = "myq";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

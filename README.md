@@ -50,8 +50,9 @@ A code only counts against the sign-in that asked for it, so run a fresh
 `auth login` only when you want a new code.
 
 The session lives in the OS keychain under the service `piekstra.myq`. When it ends
-on a login that needs a code, commands exit 3 and ask you to sign in again. They do
-not post the stored password, because that could make myQ send another code.
+on a login that needs a code, or myQ refuses the stored password, commands exit 3 and
+ask you to sign in again. They do not post that password again, because more posts
+could only send more codes or lock the account.
 
 ## Commands
 

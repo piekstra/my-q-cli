@@ -43,6 +43,7 @@ apk)
   for p in $("$ADB" -s "$serial" shell pm path "$PKG" | sed 's/package://' | tr -d '\r'); do
     "$ADB" -s "$serial" pull "$p" "$APK_DIR/" >/dev/null
   done
+  ls "$APK_DIR"/*.apk >/dev/null 2>&1 || { echo "no APK was pulled from $serial" >&2; exit 1; }
   ls -la "$APK_DIR"
   ;;
 avd)
@@ -87,6 +88,7 @@ trust)
   emu shell "ls /system/etc/security/cacerts | grep -c $name"
   ;;
 install)
+  ls "$APK_DIR"/*.apk >/dev/null 2>&1 || { echo "no APK yet: run 'capture.sh apk <phone-serial>' first" >&2; exit 1; }
   emu install-multiple -r "$APK_DIR"/*.apk
   ;;
 run)

@@ -10,7 +10,8 @@
 | Email, account id, hub address, 1Password references | `~/.config/myq/config.json` (no secrets) |
 
 Secrets enter through a no-echo prompt, `--stdin`, `--from-env`, or `--op <reference>`, never as a
-command-line argument. `MYQ_EMAIL` and `MYQ_PASSWORD` override the keychain and are never written to it.
+command-line argument. Environment variables are only sign-in inputs: `MYQ_EMAIL`, and `auth login --from-env <VAR>`.
+The session always lives in the keychain.
 
 ## Safeguards
 
@@ -21,8 +22,8 @@ command-line argument. `MYQ_EMAIL` and `MYQ_PASSWORD` override the keychain and 
 - `api` sends the token only to `https` URLs on `myq-cloud.com`.
 - The MCP door tools are marked destructive, so a client can ask before each call. A tool never prompts
   and never posts the password; it renews only with the refresh token.
-- A session that ends on a login needing a one-time code asks for a person. It does not post the password,
-  which could make myQ send more codes.
+- A stored password that myQ refused, or answers with a one-time code, is not posted again until the next
+  `auth login`. More posts could only send more codes or walk the account toward a lockout.
 
 ## The opener's local status page
 

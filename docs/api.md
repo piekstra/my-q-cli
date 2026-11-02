@@ -86,6 +86,11 @@ with no sign-in (**Live**). It exposes no door control. `myq hub status` reads o
 - **A command's status is not the door's state.** Success is a read-back showing the
   requested state. A door takes about 20 seconds to travel, and a close sounds its alarm
   first (**Assumed**).
+- **A second command mid-travel.** Some openers take one as stop or reverse. What myQ does
+  is unknown, so this client sends none while a door reads `opening` or `closing` toward the
+  requested state, and the MCP tools do not claim to be idempotent.
+- **A backslash ends a host.** URL parsers treat `\\` as `/` for https, so a hand-written host
+  check can pass a URL that goes elsewhere. `api` checks with the parser the request uses.
 - **Pinned hosts.** The app refused a proxy certificate for one media host while capturing
   (**Live**); the API hosts' pinning has not been established.
 
