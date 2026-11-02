@@ -1,0 +1,44 @@
+{
+  "count": 3,
+  "href": "https://devices.myq-cloud.com/api/v6.0/accounts/00000000-0000-0000-0000-000000000001/devices",
+  "items": [
+    {
+      "serial_number": "DUMMYSERIAL01",
+      "device_family": "garagedoor",
+      "device_platform": "myq",
+      "device_type": "wifigaragedooropener",
+      "name": "Dummy Left Door",
+      "parent_device_id": "DUMMYHUB01",
+      "state": {
+        "door_state": "closed",
+        "online": true,
+        "last_update": "2026-01-01T00:00:00.000Z",
+        "is_unattended_open_allowed": true,
+        "is_unattended_close_allowed": true
+      }
+    },
+    {
+      "serial_number": "DUMMYSERIAL02",
+      "device_family": "garagedoor",
+      "device_platform": "myq",
+      "device_type": "wifigaragedooropener",
+      "name": "Dummy Right Door",
+      "state": {
+        "door_state": "open",
+        "online": false,
+        "last_update": "2026-01-01T00:00:00.000Z"
+      }
+    },
+    {
+      "serial_number": "DUMMYHUB01",
+      "device_family": "gateway",
+      "device_platform": "myq",
+      "device_type": "wifigdogateway",
+      "name": "Dummy Hub",
+      "state": {
+        "online": true,
+        "last_update": "2026-01-01T00:00:00.000Z"
+      }
+    }
+  ]
+}

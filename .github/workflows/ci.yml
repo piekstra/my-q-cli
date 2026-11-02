@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: fmt / clippy / test / build
+    # Linux: the suite is offline and never reads a keychain. Build and clippy
+    # still typecheck the keychain path through keyring's Linux backend.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install keyring build deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: make verify
+
+  macos-smoke:
+    name: macOS smoke
+    # Only the keychain backend differs on macOS, and macOS minutes cost about
+    # ten times Linux: build and run the offline commands, nothing more.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: ./target/release/myq --version && ./target/release/myq --help > /dev/null && ./target/release/myq info > /dev/null
+
+  security:
+    name: audit / deny / secrets
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # audit-check reports through checks; gitleaks comments on pull requests.
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo-audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html><head><title>myQ</title></head>
+<body>
+<form action="/Account/LoginWithEmail?returnUrl=%2Fconnect%2Fauthorize%2Fcallback%3Fdummy%3D1" method="post">
+  <input type="checkbox" onclick="toggle()" />
+  <input type="hidden" id="ReturnUrl" name="ReturnUrl" value="/connect/authorize/callback?dummy=1" />
+  <input type="hidden" id="Brand" name="Brand" value="myq" />
+  <input type="hidden" id="UnifiedFlowRequested" name="UnifiedFlowRequested" value="True" />
+  <input type="email" id="Email" name="Email" value="" />
+  <input type="password" id="Password" name="Password" />
+  <input type="submit" value="Sign In" />
+  <input name="__RequestVerificationToken" type="hidden" value="dummy-antiforgery" />
+</form>
+</body></html>

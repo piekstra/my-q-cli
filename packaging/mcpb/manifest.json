@@ -1,0 +1,57 @@
+{
+  "manifest_version": "0.3",
+  "name": "myq",
+  "display_name": "myQ garage door (myq)",
+  "version": "0.1.0",
+  "description": "Read and move your own myQ garage doors, through the open-source myq CLI.",
+  "long_description": "Ask Claude whether a garage door is open, and have it open or close one. It uses the session `myq auth login` keeps in your OS keychain, so sign in once in a terminal first: myQ's sign-in can need a one-time code, which an extension has no way to answer. Unofficial; not affiliated with Chamberlain Group or myQ.",
+  "author": {
+    "name": "piekstra",
+    "url": "https://github.com/piekstra"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/piekstra/my-q-cli"
+  },
+  "homepage": "https://github.com/piekstra/my-q-cli",
+  "documentation": "https://github.com/piekstra/my-q-cli#use-with-claude",
+  "support": "https://github.com/piekstra/my-q-cli/issues",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["myq", "garage", "door", "smart-home"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/myq",
+    "mcp_config": {
+      "command": "${__dirname}/server/myq",
+      "args": ["mcp"],
+      "platform_overrides": {
+        "win32": {
+          "command": "${__dirname}/server/myq.exe",
+          "args": ["mcp"]
+        },
+        "linux": {
+          "command": "${__dirname}/server/linux/myq",
+          "args": ["mcp"]
+        }
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "myq_doors",
+      "description": "Your garage doors and whether each is open or closed."
+    },
+    {
+      "name": "myq_door_open",
+      "description": "Open a garage door, and report what a read-back shows."
+    },
+    {
+      "name": "myq_door_close",
+      "description": "Close a garage door, and report what a read-back shows."
+    }
+  ],
+  "tools_generated": false,
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"]
+  }
+}
