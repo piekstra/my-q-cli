@@ -8,6 +8,9 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
 
 - **Never open or close a real door without the owner's go-ahead at that moment.** It
   physically moves and exposes the house. A previous approval does not carry over.
+- **A connected phone is a real door.** Tests never reach one: door logic goes through the
+  `phone::Phone` seam, and `tests/cli_surface.rs` points `MYQ_ADB` at nothing. A screen read
+  from another app is dropped after its package name and never printed or kept.
 - **API facts come only from the myQ Android app**: its APK or its captured traffic.
   Do not read other myQ integrations, and do not copy their endpoints or flows. Label
   each fact's source in `docs/api.md`.
@@ -34,6 +37,7 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
 | `src/client.rs` | API calls, session renewal, the door command and its read-back |
 | `src/credential.rs` | The one keychain item, and the parked sign-in inside it |
 | `src/door.rs` | DTOs, parsing of API responses, and door-reference resolution |
+| `src/phone.rs` | The door path that works: the real app over adb, its screen and its button |
 | `src/hub.rs` | The opener's local status page; read-only |
 | `src/mcp.rs` | The MCP tools, over a `Source` seam |
 | `src/main.rs` | The clap tree and exit-code mapping |
@@ -42,7 +46,8 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
 
 ## Signing in as an agent
 
-Read credentials from 1Password by reference, never by printing them:
+myQ's App Check gate blocks this at the token step, so `auth login` stops before the password
+and door work goes through the phone. Should that change, read credentials from 1Password by reference, never by printing them:
 
 ```console
 $ myq auth login --email-op op://VAULT/ITEM/username --op op://VAULT/ITEM/password --non-interactive

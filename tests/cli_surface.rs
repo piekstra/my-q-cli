@@ -11,6 +11,8 @@ fn myq() -> Command {
         .env_remove("MYQ_EMAIL")
         .env_remove("MYQ_ACCOUNT")
         .env_remove("MYQ_HUB_HOST")
+        // A connected phone must be out of every test's reach: a tap moves a door.
+        .env("MYQ_ADB", "/nonexistent/adb")
         .env(
             "XDG_CONFIG_HOME",
             std::env::temp_dir().join("myq-tests-empty-config"),
@@ -117,6 +119,16 @@ fn moving_a_door_without_force_exits_6_before_touching_anything() {
 }
 
 #[test]
+fn doors_without_adb_name_what_to_install() {
+    let out = myq().args(["--json", "doors", "list"]).assert().code(5);
+    let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+    assert!(v["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("platform-tools"));
+}
+
+#[test]
 fn a_write_through_api_without_force_exits_6() {
     myq()
         .args(["--json", "api", "PUT", "/api/v6.0/x"])
@@ -142,7 +154,10 @@ fn signed_out_reads_exit_3_and_name_the_login_command() {
     if !keychain_tests_enabled() {
         return;
     }
-    let out = myq().args(["--json", "doors", "list"]).assert().code(3);
+    let out = myq()
+        .args(["--json", "doors", "list", "--cloud"])
+        .assert()
+        .code(3);
     let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
     assert_eq!(v["error"]["code"], "auth");
     assert!(v["error"]["message"]

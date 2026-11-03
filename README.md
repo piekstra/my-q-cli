@@ -6,13 +6,13 @@ myQ.
 
 Conforms to the [`piekstra-cli` spec v1](https://github.com/piekstra/cli-common).
 
-> **Status: v0.1.0, blocked. Sign-in cannot finish against a real account.** myQ
-> accepts a real email, password and texted one-time code, and then its gateway
-> refuses the token exchange (`401.122`). That request needs a Firebase App Check
-> attestation from myQ's own app, which this tool cannot provide and does not fake.
-> So no account or door has been read and **no door has been moved by this tool**.
-> While that gate is closed, `myq auth login` stops before posting the password, so
-> it spends no code. `myq hub status` needs no sign-in and works. See
+> **Status: v0.1.0. Reading a door works; moving one is untested.** myQ's cloud API
+> refuses this tool: after a real password and one-time code, its gateway answers the
+> token exchange with `401.122`, because the request has no Firebase App Check
+> attestation. Only myQ's own app can provide one, and this tool does not fake it. So
+> `myq doors` operates the real app on your Android phone over `adb`, and `doors list`
+> has read a real door that way. **No command of this tool has moved a door yet**:
+> `doors open` and `doors close` are tested only against a simulated phone. See
 > [`docs/api.md`](docs/api.md) for what is verified and what is not.
 
 ## Install
@@ -28,7 +28,24 @@ reinstall:
 $ make install
 ```
 
-## Sign in
+## Set up your phone
+
+`myq doors` and the MCP tools need:
+
+- The myQ app on an Android phone, signed in, with your door on its Home tab.
+- `adb` from Android's platform-tools on this computer. `myq` looks in `ANDROID_HOME`,
+  `ANDROID_SDK_ROOT`, the usual SDK folders and then `PATH`; `MYQ_ADB` names it directly.
+- USB debugging on (Settings > Developer options) with this computer allowed, or wireless
+  debugging. If more than one device is connected, `ANDROID_SERIAL` names the phone.
+- The phone on and unlocked when a command runs.
+
+A command brings the app to the phone's screen if another app is in front, and leaves it
+there.
+
+## Sign in to the cloud API
+
+myQ's App Check gate blocks this today, so nothing above needs it. While the gate is closed,
+`auth login` stops before posting the password and spends no code.
 
 ```console
 $ myq auth login --email you@example.com
@@ -61,8 +78,8 @@ could only send more codes or lock the account.
 
 | Command | What it does |
 | --- | --- |
-| `myq doors list` | Every door and its state |
-| `myq doors get <door>` | One door, by name, serial number or a unique part of its name |
+| `myq doors list` | Every door on the app's screen, and its state |
+| `myq doors get <door>` | One door, by name or a unique part of it |
 | `myq doors open <door>` | Open it, then wait for a read-back to show it open |
 | `myq doors close <door>` | Close it, then wait for a read-back to show it closed |
 | `myq devices list` | Every device on the account |
@@ -73,6 +90,9 @@ could only send more codes or lock the account.
 | `myq auth login\|status\|logout\|set-credential` | The stored credential |
 | `myq config`, `info`, `completions`, `self-update` | The family's standard commands |
 
+`devices`, `accounts`, `api`, `auth login` and `doors --cloud` use the cloud API, which
+myQ's gate blocks today.
+
 Every command takes `--json` and emits one document tagged with a `schema`. Exit
 codes: 0 ok, 2 usage, 3 auth, 4 not found, 5 upstream, 6 confirmation required.
 
@@ -81,16 +101,20 @@ codes: 0 ok, 2 usage, 3 auth, 4 not found, 5 upstream, 6 confirmation required.
 `doors open` and `doors close` ask first. Without a terminal they exit 6 unless given
 `--force`. A door reference that matches more than one door is an error, never a first
 pick. The command reports success only when a read-back shows the requested state:
-`--timeout` sets how long it waits (60 seconds by default) and `--no-wait` sends the
-command and reads once.
+`--timeout` sets how long it waits (60 seconds by default) and `--no-wait` taps and reads
+once.
+
+The door button is tapped only when the screen read just before it shows exactly one door,
+at rest, in the opposite state. A door that is moving, offline or in a state `myq` does not
+recognise gets no tap, because a tap mid-travel could stop or reverse it. Nothing taps twice.
 
 Opening a garage door exposes the house, and closing one can hit whatever is under it.
 Make sure you can see the door, or that you mean it.
 
 ## Use with Claude
 
-The tools are `myq_doors`, `myq_door_open` and `myq_door_close`. Sign in once in a
-terminal first: a tool never signs in, and it renews only with the refresh token.
+The tools are `myq_doors`, `myq_door_open` and `myq_door_close`. They work through the
+phone, so [set it up](#set-up-your-phone) first, on the computer running the client.
 
 | Client | How |
 | --- | --- |

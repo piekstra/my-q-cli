@@ -47,6 +47,8 @@ pub struct Account {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Door {
     pub name: String,
+    /// Empty for a door read from the phone's screen, which does not show one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub serial: String,
     /// myQ's own `door_state`, e.g. `open`, `closed`, `opening`, `closing`.
     pub state: String,
@@ -54,6 +56,9 @@ pub struct Door {
     pub online: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_update: Option<String>,
+    /// The phone app's own wording, e.g. `Closed for 14 minutes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -146,6 +151,7 @@ pub fn doors_from(value: &Value) -> Vec<Door> {
                 state: text(state, "door_state")?,
                 online: state.get("online").and_then(Value::as_bool),
                 last_update: text(state, "last_update"),
+                status: None,
             })
         })
         .collect()
@@ -157,7 +163,13 @@ pub fn find<'a>(doors: &'a [Door], query: &str) -> Result<&'a Door, CliError> {
     resolve::pick(
         doors,
         query,
-        |d| vec![d.serial.clone()],
+        |d| {
+            if d.serial.is_empty() {
+                Vec::new()
+            } else {
+                vec![d.serial.clone()]
+            }
+        },
         |d| &d.name,
         "door",
     )
