@@ -182,6 +182,17 @@ impl KeychainStore {
     }
 }
 
+/// What `auth logout --forget` owes whoever ran it, having removed a connector token: the door tools
+/// use the phone and not the session, so a running server still answers once they are signed out.
+pub fn server_keeps_its_token() -> String {
+    let bin = crate::BIN;
+    format!(
+        "`{bin} mcp --http` keeps the token it started with until it stops, and one started with \
+         --allow-writes can still move a door. To stop it: launchctl bootout \
+         gui/$(id -u)/com.piekstra.{bin}-mcp-http"
+    )
+}
+
 impl Default for KeychainStore {
     fn default() -> Self {
         Self::new()
@@ -201,6 +212,18 @@ impl TokenStore for KeychainStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logout_says_how_to_stop_a_server_that_can_still_move_a_door() {
+        let note = server_keeps_its_token();
+        assert!(note.contains("myq mcp --http"), "{note}");
+        assert!(note.contains("--allow-writes"), "{note}");
+        assert!(note.contains("can still move a door"), "{note}");
+        assert!(
+            note.contains("launchctl bootout gui/$(id -u)/com.piekstra.myq-mcp-http"),
+            "{note}"
+        );
+    }
     use crate::client::testing::Memory;
 
     #[test]

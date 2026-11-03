@@ -111,7 +111,8 @@ once.
 
 The door button is tapped only when the screen read just before it shows exactly one door,
 at rest, in the opposite state. A door that is moving, offline or in a state `myq` does not
-recognise gets no tap, because a tap mid-travel could stop or reverse it. Nothing taps twice.
+recognise gets no tap, because a tap mid-travel could stop or reverse it. No command taps twice,
+and while one is running, a second, from a terminal or a server, is refused with nothing tapped.
 
 Opening a garage door exposes the house, and closing one can hit whatever is under it.
 Make sure you can see the door, or that you mean it.

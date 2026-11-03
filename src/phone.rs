@@ -4,7 +4,9 @@
 //!
 //! A tap moves a real door, so one is sent only when the screen read just before it
 //! shows exactly one door, at rest, in the state opposite the one asked for. Nothing
-//! retries a tap. Another app's screen is never read beyond its package name.
+//! retries a tap, and a door command holds a lock from its first read to its last, so a
+//! second one, from any process, is refused and cannot tap a door the first has moved.
+//! Another app's screen is never read beyond its package name.
 //!
 //! An MCP tool passes its call's [`SendDeadline`], and past that nothing goes to the
 //! phone. The CLI's own commands pass none: someone is at the terminal, and no server
@@ -17,6 +19,7 @@ use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use pk_cli_auth::refresh_lock::RefreshLock;
 use pk_cli_core::CliError;
 use pk_cli_mcp::SendDeadline;
 
@@ -43,6 +46,8 @@ pub trait Phone {
     /// Bring that activity to the phone's screen.
     fn start_activity(&self, activity: &str) -> Result<(), CliError>;
     fn tap(&self, x: u32, y: u32) -> Result<(), CliError>;
+    /// The lock every door command on this machine shares.
+    fn door_lock(&self) -> Result<RefreshLock, CliError>;
 }
 
 pub struct Adb {
@@ -137,6 +142,13 @@ impl Phone for Adb {
         let (x, y) = (x.to_string(), y.to_string());
         self.run(&["shell", "input", "tap", &x, &y])?;
         Ok(())
+    }
+
+    /// Beside the session's lock, and anchored the same way, so a launchd agent and a terminal
+    /// contend on one file whatever their environments say.
+    fn door_lock(&self) -> Result<RefreshLock, CliError> {
+        let beside = RefreshLock::for_binary(crate::BIN)?;
+        Ok(RefreshLock::at(beside.path().with_file_name("door.lock")))
     }
 }
 
@@ -414,10 +426,36 @@ pub fn doors<P: Phone>(
         .collect())
 }
 
+/// [`move_door`] as the only door command running on this machine. The CLI, a stdio server and
+/// `mcp --http` are separate processes, and `--http` runs its calls side by side. Two of them could
+/// each read a door at rest, and the app's status lags its button, so the second tap would stop or
+/// reverse a door the first had moved. This does not wait, so no time goes against a deadline, and
+/// a lock that cannot be taken taps nothing.
+pub fn set_door<P: Phone>(
+    phone: &P,
+    query: &str,
+    command: DoorCommand,
+    wait: Wait,
+    sleep: &dyn Fn(Duration),
+    deadline: Option<&SendDeadline>,
+) -> Result<DoorChange, CliError> {
+    phone
+        .door_lock()?
+        .try_hold(|| move_door(phone, query, command, wait, sleep, deadline))?
+        .ok_or_else(|| {
+            CliError::Other(
+                "another door command is running on this machine, so nothing was tapped. A tap \
+                 now could stop or reverse the door, so let that command finish and check the \
+                 door before trying again."
+                    .into(),
+            )
+        })
+}
+
 /// Tap a door's button if that is what it takes, then read back until the door shows
 /// the requested state. A read that fails while waiting is not an error yet, because
 /// the door is moving either way, and nothing here taps a second time.
-pub fn set_door<P: Phone>(
+fn move_door<P: Phone>(
     phone: &P,
     query: &str,
     command: DoorCommand,
@@ -476,6 +514,10 @@ pub fn set_door<P: Phone>(
         confirmed,
     };
     if wait.timeout.is_zero() {
+        // The app's status lags its button, and the next command's read comes after this returns.
+        if sent {
+            sleep(wait.interval);
+        }
         let read = read_door(phone, &name).unwrap_or(Door {
             state: "unknown".into(),
             status: None,
@@ -557,6 +599,15 @@ pub(crate) mod tests {
         pub(crate) read_takes: Cell<Duration>,
         pub(crate) read_sleeps: Cell<Duration>,
         pub(crate) resolve_takes: Cell<Duration>,
+        door_lock: PathBuf,
+        /// Runs once, in the first screen read, as another command arriving mid-way.
+        during_first_read: RefCell<Option<Box<dyn FnOnce()>>>,
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.door_lock);
+        }
     }
 
     impl Fake {
@@ -572,12 +623,27 @@ pub(crate) mod tests {
                 read_takes: Cell::new(Duration::ZERO),
                 read_sleeps: Cell::new(Duration::ZERO),
                 resolve_takes: Cell::new(Duration::ZERO),
+                door_lock: fresh_lock_path(),
+                during_first_read: RefCell::default(),
             }
         }
     }
 
+    fn fresh_lock_path() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("myq-door-{}-{n}.lock", std::process::id()))
+    }
+
     impl Phone for Fake {
+        fn door_lock(&self) -> Result<RefreshLock, CliError> {
+            Ok(RefreshLock::at(&self.door_lock))
+        }
+
         fn screen_xml(&self) -> Result<String, CliError> {
+            if let Some(arrives) = self.during_first_read.borrow_mut().take() {
+                arrives();
+            }
             self.reads.set(self.reads.get() + 1);
             std::thread::sleep(self.read_delay);
             self.clock.advance(self.read_takes.get());
@@ -851,6 +917,78 @@ pub(crate) mod tests {
     }
 
     /// The CLI's own commands pass no deadline: a person at the terminal is watching.
+    /// Each command opens the lock's file for itself, as a second process does, so this takes
+    /// the path a real overlap takes. The refusal comes before the second reads or taps.
+    #[test]
+    fn a_door_command_during_another_taps_nothing() {
+        let mut first = Fake::new(&[HOME.to_string(), reading("Open")]);
+        let second = std::rc::Rc::new(Fake::new(&[HOME.to_string(), reading("Open")]));
+        first.door_lock = second.door_lock.clone();
+        let refused = std::rc::Rc::new(RefCell::new(None));
+        let (other, answer) = (second.clone(), refused.clone());
+        *first.during_first_read.borrow_mut() = Some(Box::new(move || {
+            *answer.borrow_mut() = Some(set(&other, DoorCommand::Open));
+        }));
+
+        assert!(set(&first, DoorCommand::Open).unwrap().confirmed);
+        assert_eq!(first.taps.borrow().len(), 1);
+
+        let err = refused.borrow_mut().take().unwrap().unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        let text = err.to_string();
+        assert!(text.contains("another door command"), "{text}");
+        assert!(text.contains("nothing was tapped"), "{text}");
+        assert!(second.taps.borrow().is_empty());
+        assert_eq!(second.reads.get(), 0);
+
+        // The first has finished, so the lock is free.
+        assert!(set(&second, DoorCommand::Open).unwrap().confirmed);
+        assert_eq!(second.taps.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_lock_that_cannot_be_taken_taps_nothing() {
+        let mut fake = Fake::new(&[HOME.to_string(), reading("Open")]);
+        let a_file = fake.door_lock.clone();
+        std::fs::write(&a_file, "").unwrap();
+        fake.door_lock = a_file.join("door.lock");
+        assert!(set(&fake, DoorCommand::Open).is_err());
+        assert!(fake.taps.borrow().is_empty());
+        assert_eq!(fake.reads.get(), 0);
+        std::fs::remove_file(a_file).unwrap();
+    }
+
+    /// `--no-wait` still holds the lock past the app's lag, so the next command's read sees the
+    /// door moving. A door it did not tap has nothing to wait for.
+    #[test]
+    fn no_wait_holds_the_lock_one_interval_after_a_tap_only() {
+        let no_wait = Wait {
+            timeout: Duration::ZERO,
+            interval: Duration::from_secs(3),
+        };
+        for (screens, naps) in [
+            (
+                vec![HOME.to_string(), reading("Opening")],
+                vec![Duration::from_secs(3)],
+            ),
+            (vec![reading("Opening")], vec![]),
+        ] {
+            let fake = Fake::new(&screens);
+            let slept = RefCell::new(Vec::new());
+            let change = set_door(
+                &fake,
+                "garage",
+                DoorCommand::Open,
+                no_wait,
+                &|nap| slept.borrow_mut().push(nap),
+                None,
+            )
+            .unwrap();
+            assert!(!change.confirmed);
+            assert_eq!(slept.into_inner(), naps);
+        }
+    }
+
     #[test]
     fn without_a_deadline_a_slow_phone_still_gets_its_tap() {
         let fake = Fake::new(&[HOME.to_string(), reading("Open")]);

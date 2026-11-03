@@ -8,9 +8,13 @@
   cannot move a door after whoever asked has stopped waiting. The read-back stops at 85 seconds, so
   the slowest answer still arrives inside the 120 seconds `--http` waits. The CLI's own commands are
   unchanged.
+- One door command at a time. A command on the phone holds a lock from its first read to its last, and
+  a second one, from a terminal or a server, is refused with nothing tapped, because the app's status
+  lags its button and a tap on a moving door could stop or reverse it. `--no-wait` holds it three seconds
+  longer, after its tap.
 - `myq mcp --http --port <PORT>` serves the tools on 127.0.0.1 behind a bearer token, for Claude on the
   web and mobile through your own Cloudflare Worker and tunnel. It serves `myq_doors` alone unless
   started with `--allow-writes`, and **with that flag whoever holds the token can move your door**.
-  `myq mcp --new-token` makes the token, and `auth logout --forget` removes it. `self-update` reminds
-  you to restart a running server.
+  `myq mcp --new-token` makes the token, and `auth logout --forget` removes it and says how to stop a
+  server still running with its own copy. `self-update` reminds you to restart a running server.
 - Moved to cli-common v0.25.0.

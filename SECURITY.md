@@ -22,7 +22,10 @@ carry no secrets, though `MYQ_ADB` does name a program `myq` will run.
   they cannot ask. The check runs before any phone, keychain or network work.
 - A door reference that matches more than one door is an error, never a first pick.
 - The phone's door button is tapped only when the screen read just before it shows exactly one door, at
-  rest, in the opposite state, and nothing taps twice.
+  rest, in the opposite state, and no command taps twice.
+- A door command on the phone holds a lock (`~/.config/myq/door.lock`) from its first read to its last. A
+  second one, from any process, is refused with nothing tapped, because the app's status lags its button
+  and a tap on a moving door could stop or reverse it.
 - A door command succeeds only when a read-back shows the requested state.
 - `api` sends the token only to `https` URLs on `myq-cloud.com`.
 - The MCP door tools are marked destructive, so a client can ask before each call. `myq_doors` only reads;
@@ -62,8 +65,10 @@ leaked token reaches, is in the
 [connector's threat model](https://github.com/piekstra/cli-common/tree/main/connector#threat-model).
 
 `myq auth logout --forget` removes the stored credential and `mcp-http-token`. A server already running
-keeps the token it started with and goes on answering until it is stopped; plain `auth logout` keeps
-the token. To revoke the connector's access and keep serving, run `myq mcp --new-token --overwrite` and
+keeps the token it started with and goes on answering until it is stopped, and the command says so,
+because the door tools use the phone and not the session. A token it cannot remove still lets it clear
+the session and the config, and it then says so and exits nonzero. Plain `auth logout` keeps the token.
+To revoke the connector's access and keep serving, run `myq mcp --new-token --overwrite` and
 restart the server (`launchctl kickstart -k gui/$(id -u)/com.piekstra.myq-mcp-http`); the old token
 works until the restart. To stop serving, run `launchctl bootout
 gui/$(id -u)/com.piekstra.myq-mcp-http` and stop the tunnel.

@@ -84,7 +84,8 @@ enum AuthCmd {
     Login(LoginCmd),
     /// Report the stored credential and session (auth-status/v1). Makes no request.
     Status,
-    /// Clear the session; --forget also removes the password and saved identity.
+    /// Clear the session; --forget also removes the password, the saved identity and the
+    /// `mcp --http` connector token.
     Logout(LogoutArgs),
     /// Replace the stored password without signing in, for rotation or headless setup.
     SetCredential(SetCredentialCmd),
@@ -466,19 +467,23 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
             Ok(())
         }
         AuthCmd::Logout(args) => {
+            let mut token_removed = false;
             if args.forget {
                 keychain.delete()?;
                 // Nothing records whether `mcp --new-token` ran, so this read is ungated: a
                 // keyring that is not running, or a prompt declined, must not leave the config.
                 let token = keychain.delete_connector_token();
                 store.clear()?;
-                token.map_err(connector_token_stays)?;
+                token_removed = token.map_err(connector_token_stays)?;
             } else if let Some(mut credentials) = keychain.load()? {
                 credentials.sign_out();
                 keychain.save(&credentials)?;
             }
             if !cli.common.quiet {
                 eprintln!("signed out");
+                if token_removed {
+                    eprintln!("{}", myq::credential::server_keeps_its_token());
+                }
             }
             Ok(())
         }
