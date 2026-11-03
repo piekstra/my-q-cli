@@ -1,14 +1,16 @@
 <!DOCTYPE html>
 <html><head><title>myQ</title></head>
 <body>
-<form action="/Account/DummyVerify?returnUrl=x" method="post">
-  <input type="hidden" name="SelectedMfaMethod" value="Email" />
-  <input type="hidden" name="IsSmsMethodEnabled" value="True" />
-  <input type="hidden" name="MaskedEmail" value="d***@example.com" />
-  <input type="hidden" name="MaskedPhoneNumber" value="***-***-0100" />
-  <input type="checkbox" name="Unticked" value="true" />
-  <input type="text" name="Otp" value="" />
-  <input type="submit" name="Submit" value="Verify" />
+<a href="/AccountMfa/VerifyOtp">Send the code via email instead</a>
+<form action="/AccountMfa/VerifyOtp" method="post">
+  <input type="hidden" id="SelectedMfaMethod" name="SelectedMfaMethod" value="Sms" />
+  <input type="hidden" id="IsSmsMethodEnabled" name="IsSmsMethodEnabled" value="True" />
+  <input type="hidden" id="MaskedEmail" name="MaskedEmail" value="d***@example.com" />
+  <input type="hidden" id="MaskedPhoneNumber" name="MaskedPhoneNumber" value="(XXX) XXX-0100" />
+  <input type="number" id="login-otp" name="Otp" value="" />
+  <input type="hidden" name="__Invariant" value="Otp" />
+  <a href="/AccountMfa/VerifyOtp">Send me a new code</a>
+  <input type="submit" id="continue_button" value="Continue" disabled />
   <input name="__RequestVerificationToken" type="hidden" value="dummy-step-token" />
 </form>
 </body></html>

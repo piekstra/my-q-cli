@@ -18,6 +18,8 @@ pub const IDS: &str = "https://partner-identity.myq-cloud.com";
 pub const CLIENT_ID: &str = "ANDROID_CGI_MYQ";
 pub const SCOPE: &str = "MyQ_Residential offline_access";
 pub const REDIRECT_URI: &str = "com.myqops://android";
+/// myQ's gateway answers this on a token request with no Firebase App Check attestation.
+const NO_ATTESTATION: &str = "401.122";
 /// The app's `"%s %s brand:%s"` with an empty create-user part: hence two spaces.
 const ACR_VALUES: &str = "unified_flow:v1  brand:myq";
 const MAX_HOPS: usize = 10;
@@ -188,6 +190,14 @@ enum Landing {
 }
 
 fn refused(response: &HttpResponse) -> Option<CliError> {
+    if response.status == 401 && gateway_code(&response.body).is_some_and(is_no_attestation) {
+        return Some(CliError::Upstream(format!(
+            "myQ refused this client ({NO_ATTESTATION}, \"the application is unauthorized\"). \
+             Its token endpoint requires a Firebase App Check attestation from myQ's own app, \
+             which `{}` cannot provide, so sign-in cannot finish. See docs/api.md",
+            crate::BIN
+        )));
+    }
     let challenged = response.header_value("cf-mitigated").is_some()
         || (response.status == 403 && response.body.contains("Just a moment"));
     challenged.then(|| {
@@ -196,6 +206,15 @@ fn refused(response: &HttpResponse) -> Option<CliError> {
             response.status
         ))
     })
+}
+
+fn gateway_code(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    parsed.get("code")?.as_str().map(str::to_string)
+}
+
+fn is_no_attestation(code: String) -> bool {
+    code.starts_with(NO_ATTESTATION)
 }
 
 /// Follow redirects until a page or the authorization code.
@@ -517,6 +536,7 @@ pub async fn begin<T: Transport>(
     let post = HttpRequest::new("POST", target.clone())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(form_body(&fields));
+    check_token_gate(transport).await?;
     let outcome = after_the_password(transport, jar, post, target, &pkce.verifier).await;
     Ok(outcome.unwrap_or_else(Begun::FailedAfterPost))
 }
@@ -621,6 +641,30 @@ fn parse_tokens(response: &HttpResponse) -> Result<Tokens, CliError> {
     })
 }
 
+/// Ask the token endpoint whether it will serve this client, before a password post
+/// texts a code that could never be redeemed. The gate gives a dummy code the same
+/// refusal as a real one, and an open gate spends nothing on a dummy code.
+async fn check_token_gate<T: Transport>(transport: &T) -> Result<(), CliError> {
+    let body = form_body(&[
+        ("client_id", CLIENT_ID),
+        ("grant_type", "authorization_code"),
+        ("code", "gate-check"),
+        ("redirect_uri", REDIRECT_URI),
+        ("code_verifier", "gate-check"),
+    ]);
+    let response = token_request(transport, body).await?;
+    if let Some(err) = refused(&response) {
+        return Err(err);
+    }
+    if response.status >= 500 {
+        return Err(CliError::Upstream(format!(
+            "myQ's token endpoint answered {}",
+            token_refusal(&response)
+        )));
+    }
+    Ok(())
+}
+
 /// The app also sends a `Firebase-AppCheck-Token` header here. This client
 /// sends none: it has no attestation to offer and does not pretend otherwise.
 async fn exchange<T: Transport>(
@@ -703,10 +747,22 @@ mod tests {
         }
     }
 
+    fn gate_open() -> HttpResponse {
+        HttpResponse::new(400, r#"{"error":"invalid_grant"}"#)
+    }
+
+    fn gate_closed() -> HttpResponse {
+        HttpResponse::new(
+            401,
+            r#"{"code":"401.122","message":"Unauthorized","description":"The application is unauthorized"}"#,
+        )
+    }
+
     fn to_code_step() -> Vec<HttpResponse> {
         vec![
             redirect("/Account/Login?ReturnUrl=x").header("set-cookie", "sid=dummy1; Path=/"),
             HttpResponse::new(200, LOGIN_PAGE),
+            gate_open(),
             HttpResponse::new(200, CODE_STEP).header("set-cookie", "mfa=dummy2; Path=/"),
         ]
     }
@@ -715,15 +771,34 @@ mod tests {
     fn the_code_step_is_read_from_the_page() {
         let step = parse_code_step(CODE_STEP).expect("a code step");
         assert_eq!(step.field, "Otp");
-        assert_eq!(step.action, "/Account/DummyVerify?returnUrl=x");
-        assert_eq!(step.channel.as_deref(), Some("Email"));
-        assert_eq!(step.sent_to_hint.as_deref(), Some("d***@example.com"));
+        assert_eq!(step.action, "/AccountMfa/VerifyOtp");
+        assert_eq!(step.channel.as_deref(), Some("Sms"));
+        assert_eq!(step.sent_to_hint.as_deref(), Some("(XXX) XXX-0100"));
         let names: Vec<&str> = step.fields.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"__RequestVerificationToken"));
         assert!(names.contains(&"SelectedMfaMethod"));
+        assert!(names.contains(&"__Invariant"));
         assert!(!names.contains(&"Otp"), "the code field is filled in later");
-        assert!(!names.contains(&"Unticked"), "{names:?}");
         assert!(parse_code_step(LOGIN_PAGE).is_none());
+    }
+
+    #[test]
+    fn a_code_sent_by_email_names_the_email() {
+        let page = CODE_STEP.replace("value=\"Sms\"", "value=\"Email\"");
+        let step = parse_code_step(&page).expect("a code step");
+        assert_eq!(step.sent_to_hint.as_deref(), Some("d***@example.com"));
+    }
+
+    #[test]
+    fn a_browser_leaves_buttons_and_unticked_boxes_out_of_a_form() {
+        assert!(!submits_with_the_form(r#"<input type="submit" value="x">"#));
+        assert!(!submits_with_the_form(
+            r#"<input type="checkbox" name="x">"#
+        ));
+        assert!(submits_with_the_form(
+            r#"<input type="checkbox" name="x" checked>"#
+        ));
+        assert!(submits_with_the_form(r#"<input type="number" name="x">"#));
     }
 
     #[test]
@@ -768,10 +843,10 @@ mod tests {
         assert_eq!(tokens.access_token, "dummy-access-token");
 
         let sent = scripted.sent();
-        let post = &sent[3];
+        let post = &sent[4];
         assert_eq!(
             post.url,
-            "https://partner-identity.myq-cloud.com/Account/DummyVerify?returnUrl=x"
+            "https://partner-identity.myq-cloud.com/AccountMfa/VerifyOtp"
         );
         let body = post.body.as_deref().unwrap();
         assert!(body.contains("Otp=123456"), "{body}");
@@ -781,7 +856,7 @@ mod tests {
             header_of(post, "cookie").as_deref(),
             Some("sid=dummy1; mfa=dummy2")
         );
-        let exchange = sent[4].body.as_deref().unwrap();
+        let exchange = sent[5].body.as_deref().unwrap();
         assert!(exchange.contains(&format!("code_verifier={}", pkce().verifier)));
     }
 
@@ -879,6 +954,7 @@ mod tests {
         let scripted = Scripted::new(vec![
             redirect("/Account/Login?ReturnUrl=x").header("set-cookie", "sid=dummy1; Path=/"),
             HttpResponse::new(200, LOGIN_PAGE).header("set-cookie", "anti=dummy2; Path=/"),
+            gate_open(),
             redirect("/connect/authorize/callback?x=1"),
             redirect("com.myqops://android?code=dummycode&scope=x"),
             HttpResponse::new(200, TOKEN),
@@ -894,8 +970,14 @@ mod tests {
         assert_eq!(tokens.refresh_token.as_deref(), Some("dummy-refresh-token"));
 
         let sent = scripted.sent();
-        assert_eq!(sent.len(), 5);
-        let post = &sent[2];
+        assert_eq!(sent.len(), 6);
+        let gate = sent[2].body.as_deref().unwrap();
+        assert!(sent[2].url.ends_with("/connect/token"));
+        assert!(
+            !gate.contains("dummy-pass") && !gate.contains("dummy%40"),
+            "{gate}"
+        );
+        let post = &sent[3];
         assert_eq!(post.method, "POST");
         assert!(post.url.contains("/Account/LoginWithEmail"));
         let body = post.body.as_deref().unwrap();
@@ -907,7 +989,7 @@ mod tests {
             Some("sid=dummy1; anti=dummy2")
         );
 
-        let token = &sent[4];
+        let token = &sent[5];
         assert_eq!(
             token.url,
             "https://partner-identity.myq-cloud.com/connect/token"
@@ -924,6 +1006,7 @@ mod tests {
         let scripted = Scripted::new(vec![
             redirect("/Account/Login?ReturnUrl=x"),
             HttpResponse::new(200, LOGIN_PAGE),
+            gate_open(),
             HttpResponse::new(200, LOGIN_PAGE),
         ]);
         let err = block_on(login(
@@ -945,6 +1028,7 @@ mod tests {
         let scripted = Scripted::new(vec![
             redirect("/Account/Login?ReturnUrl=x"),
             HttpResponse::new(200, LOGIN_PAGE),
+            gate_open(),
             HttpResponse::new(200, step),
         ]);
         let err = block_on(login(
@@ -977,6 +1061,56 @@ mod tests {
         assert_eq!(err.exit_code(), 5);
         assert!(err.to_string().contains("evil.example"));
         assert_eq!(scripted.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_closed_gate_stops_before_the_password_is_posted() {
+        let scripted = Scripted::new(vec![
+            redirect("/Account/Login?ReturnUrl=x"),
+            HttpResponse::new(200, LOGIN_PAGE),
+            gate_closed(),
+        ]);
+        let err = block_on(begin(
+            &scripted,
+            "dummy@example.invalid",
+            "dummy-pass",
+            &pkce(),
+        ))
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("App Check"), "{err}");
+        let sent = scripted.sent();
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|r| {
+            let body = r.body.as_deref().unwrap_or_default();
+            !body.contains("dummy-pass") && !body.contains("dummy%40")
+        }));
+        assert!(header_of(&sent[2], "firebase-appcheck-token").is_none());
+    }
+
+    #[test]
+    fn an_exchange_refused_for_attestation_says_so() {
+        let scripted = Scripted::new(vec![
+            redirect("com.myqops://android?code=dummycode"),
+            gate_closed(),
+        ]);
+        let err = block_on(login(
+            &scripted,
+            "dummy@example.invalid",
+            "dummy-pass",
+            &pkce(),
+        ))
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("App Check"), "{err}");
+    }
+
+    #[test]
+    fn a_renewal_refused_for_attestation_does_not_read_as_a_dead_session() {
+        let scripted = Scripted::new(vec![gate_closed()]);
+        let err = block_on(refresh(&scripted, "dummy-refresh")).unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("App Check"), "{err}");
     }
 
     #[test]

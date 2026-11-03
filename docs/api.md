@@ -34,17 +34,22 @@ id `ANDROID_CGI_MYQ`, scope `MyQ_Residential offline_access`, redirect
 2. That redirects to `/Account/Login`, a server-rendered page behind Cloudflare. Its form
    posts `Email`, `Password`, `ReturnUrl`, `Brand`, `UnifiedFlowRequested` and
    `__RequestVerificationToken` to `/Account/LoginWithEmail` (**Live**).
-3. With the right password, the next page has the inputs `SelectedMfaMethod`,
-   `IsSmsMethodEnabled`, `MaskedEmail`, `MaskedPhoneNumber` and `Otp` (**Live**). How the
-   code is requested and submitted is **Assumed**: this client posts the form holding
-   `Otp`, as a browser would.
-4. The sign-in ends in a redirect to `com.myqops://android?code=…` (**APK**).
+3. The right password redirects to `/AccountMfa/VerifyOtp`, and reaching that page sends
+   the code, by text message on the account tried (**Live**). Its form posts the 6-digit
+   `Otp` with the hidden `SelectedMfaMethod` (`Sms`), `IsSmsMethodEnabled`, `MaskedEmail`,
+   `MaskedPhoneNumber`, `__Invariant` (`Otp`) and `__RequestVerificationToken` back to
+   `/AccountMfa/VerifyOtp` (**Live**). The page's script only validates the input, so this
+   is a plain form post (**Live**). Links offer "Send the code via email instead" and "Send
+   me a new code"; their query strings have not been read, and this client uses neither.
+4. The right code redirects to `com.myqops://android?code=…` (**Live**).
 5. `POST /connect/token` with `client_id`, `scope`, `grant_type=authorization_code`,
-   `code`, `redirect_uri` and `code_verifier` (**APK**).
+   `code`, `redirect_uri` and `code_verifier` (**APK**), plus the attestation described
+   under Traps. **This step is where sign-in stops** (**Live**).
 
 Renewal is `POST /connect/token` with `client_id`, `scope`, `redirect_uri`,
-`grant_type=refresh_token` and `refresh_token` (**APK**). Whether refresh tokens rotate
-is unknown; this client saves one whenever it gets one.
+`grant_type=refresh_token` and `refresh_token` (**APK**). The app files `401.122` under
+renewal failures too, so renewal is behind the same gate (**APK**). Whether refresh tokens
+rotate is unknown.
 
 ## Reading
 
@@ -72,9 +77,13 @@ with no sign-in (**Live**). It exposes no door control. `myq hub status` reads o
 
 ## Traps
 
-- **Firebase App Check.** The app sends a `Firebase-AppCheck-Token` header on the code
-  exchange (**APK**). This client sends none and has not yet reached that step, so whether
-  myQ enforces it is unknown. If it does, sign-in stops at the exchange with myQ's refusal.
+- **Firebase App Check blocks this client.** The app sends a `Firebase-AppCheck-Token`
+  header on the code exchange (**APK**). Without one, `/connect/token` answers HTTP 401 with
+  `{"code":"401.122","description":"The application is unauthorized"}`, to a real code and
+  to a dummy one alike (**Live**), and the app labels that code `REFRESH_APP_CHECK_FAILED`
+  (**APK**). The sign-in page, password and text-message code all work without it, so the
+  failure appears only after a code has been spent. `begin` therefore checks the gate with a
+  dummy code before posting the password. This client does not fake attestation.
 - **A password post may send a code.** Retrying a sign-in can spend codes and walk the
   account toward a lockout, so nothing here retries one, and a session that ends on a login
   needing a code asks for a person instead of posting the password.

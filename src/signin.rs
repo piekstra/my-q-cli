@@ -173,6 +173,7 @@ mod tests {
         vec![
             redirect("/Account/Login?ReturnUrl=x"),
             HttpResponse::new(200, LOGIN_PAGE),
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
         ]
     }
 
@@ -253,7 +254,7 @@ mod tests {
         assert!(item.password_blocked);
         assert!(item.access_token.is_none());
         let waiting = item.pending.expect("parked");
-        assert_eq!(waiting.sent_to_hint.as_deref(), Some("d***@example.com"));
+        assert_eq!(waiting.sent_to_hint.as_deref(), Some("(XXX) XXX-0100"));
     }
 
     #[test]

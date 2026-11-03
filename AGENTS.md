@@ -11,9 +11,10 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
 - **API facts come only from the myQ Android app**: its APK or its captured traffic.
   Do not read other myQ integrations, and do not copy their endpoints or flows. Label
   each fact's source in `docs/api.md`.
-- **No attestation forgery.** The app sends a Firebase App Check token on the token
-  exchange; this client sends none. Do not fake that header, send the app's failure
-  marker, or spoof a TLS fingerprint. If myQ starts requiring it, report that.
+- **No attestation forgery.** myQ requires a Firebase App Check token on the token
+  exchange and answers `401.122` without one, so sign-in cannot finish. Do not fake or
+  replay that header, send the app's failure marker, spoof a TLS fingerprint, or try
+  other clients or paths around the gate. Report the block instead.
 - **Every password post can cost a one-time code**, and failed posts can lock the
   account. Never put a sign-in in a loop or a retry. After a failure, diagnose first.
 - **The repo carries no personal data.** Runtime output may; tracked files may not.
@@ -48,7 +49,7 @@ $ myq auth login --email-op op://VAULT/ITEM/username --op op://VAULT/ITEM/passwo
 ```
 
 That exits 3 with the sign-in parked when myQ wants a code. Get the code from the owner
-or their mailbox and finish with `printf '%s' "$CODE" | myq auth login --code -`.
+or, when myQ emails it, their mailbox, and finish with `printf '%s' "$CODE" | myq auth login --code -`.
 
 If `op` or a keychain read hangs or times out, the owner was not there to approve it.
 Stop calling it, say what you need, and wait.

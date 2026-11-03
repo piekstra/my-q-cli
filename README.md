@@ -6,11 +6,14 @@ myQ.
 
 Conforms to the [`piekstra-cli` spec v1](https://github.com/piekstra/cli-common).
 
-> **Status: v0.1.0, not yet working end to end against a real account.** myQ
-> accepted a real email and password and then asked for a one-time code. The code
-> step is written and tested only against a hand-written page, so no sign-in has
-> finished, no account or door has been read, and **no door has been moved by this
-> tool**. See [`docs/api.md`](docs/api.md) for what is verified and what is not.
+> **Status: v0.1.0, blocked. Sign-in cannot finish against a real account.** myQ
+> accepts a real email, password and texted one-time code, and then its gateway
+> refuses the token exchange (`401.122`). That request needs a Firebase App Check
+> attestation from myQ's own app, which this tool cannot provide and does not fake.
+> So no account or door has been read and **no door has been moved by this tool**.
+> While that gate is closed, `myq auth login` stops before posting the password, so
+> it spends no code. `myq hub status` needs no sign-in and works. See
+> [`docs/api.md`](docs/api.md) for what is verified and what is not.
 
 ## Install
 

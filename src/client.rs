@@ -651,6 +651,7 @@ mod tests {
         let scripted = Scripted::new(vec![
             HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(200, include_str!("../tests/fixtures/login_page.html")),
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(200, include_str!("../tests/fixtures/code_step.html")),
         ]);
         let store = expired();
@@ -671,6 +672,7 @@ mod tests {
         let scripted = Scripted::new(vec![
             HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(200, login_page),
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(200, login_page),
         ]);
         let store = expired();
@@ -691,6 +693,7 @@ mod tests {
         let scripted = Scripted::new(vec![
             HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(200, include_str!("../tests/fixtures/login_page.html")),
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(302, "").header("location", "com.myqops://android?code=dummycode"),
             HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
         ]);
@@ -715,12 +718,29 @@ mod tests {
         let scripted = Scripted::new(vec![
             HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(200, include_str!("../tests/fixtures/login_page.html")),
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
             HttpResponse::new(429, ""),
         ]);
         let store = expired();
         let client = Client::new(&scripted, &store);
         block_on(client.doors(ACCOUNT)).unwrap_err();
         assert!(store.0.borrow().as_ref().unwrap().password_blocked);
+    }
+
+    #[test]
+    fn a_closed_gate_leaves_the_password_unposted_and_unblocked() {
+        let scripted = Scripted::new(vec![
+            HttpResponse::new(400, r#"{"error":"invalid_grant"}"#),
+            HttpResponse::new(200, include_str!("../tests/fixtures/login_page.html")),
+            HttpResponse::new(401, r#"{"code":"401.122"}"#),
+        ]);
+        let store = expired();
+        let client = Client::new(&scripted, &store);
+        let err = block_on(client.doors(ACCOUNT)).unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("App Check"), "{err}");
+        assert_eq!(scripted.sent().len(), 3);
+        assert!(!store.0.borrow().as_ref().unwrap().password_blocked);
     }
 
     #[test]
