@@ -91,7 +91,11 @@ could only send more codes or lock the account.
 | `myq config`, `info`, `completions`, `self-update` | The family's standard commands |
 
 `devices`, `accounts`, `api`, `auth login` and `doors --cloud` use the cloud API, which
-myQ's gate blocks today.
+myQ's gate blocks today. `--account` and `MYQ_ACCOUNT` apply only to those: `doors` without
+`--cloud` and `mcp` refuse them, because the phone acts on the account its app is signed in to.
+
+Through the phone, a door document carries `name`, `state` and `status` (the app's wording),
+plus `online: false` for an offline door. `serial` and `last_update` appear only with `--cloud`.
 
 Every command takes `--json` and emits one document tagged with a `schema`. Exit
 codes: 0 ok, 2 usage, 3 auth, 4 not found, 5 upstream, 6 confirmation required.

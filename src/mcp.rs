@@ -35,12 +35,7 @@ pub struct PhoneApp;
 
 impl Source for PhoneApp {
     async fn doors(&self) -> Result<Vec<Door>, CliError> {
-        phone::doors_on_screen(&Adb::locate())?.ok_or_else(|| {
-            CliError::Upstream(format!(
-                "No door is on the phone's screen: the myQ app is not in front, or is off its \
-                 Home tab. Call {APP_OPEN} to bring it forward"
-            ))
-        })
+        phone::doors_on_screen(&Adb::locate())
     }
 
     async fn open_app(&self) -> Result<usize, CliError> {
@@ -224,7 +219,8 @@ impl<S: Source> MyqTools<S> {
         let matched: Vec<DoorItem> = self
             .source
             .doors()
-            .await?
+            .await
+            .map_err(|e| fix_not_found(e, format!("Call {APP_OPEN} to bring the app forward")))?
             .into_iter()
             .filter(|d| state.is_none_or(|s| d.state.eq_ignore_ascii_case(s)))
             .map(|d| DoorItem::from(d, detailed))
@@ -237,16 +233,18 @@ impl<S: Source> MyqTools<S> {
             .source
             .set_door(&args.door, command)
             .await
-            .map_err(|e| {
-                let not_found = matches!(e, CliError::NotFound(_));
-                let error = ToolError::from(e);
-                if not_found {
-                    error.with_fix(format!("Call {DOORS} for the exact names"))
-                } else {
-                    error
-                }
-            })?;
+            .map_err(|e| fix_not_found(e, format!("Call {DOORS} for the exact names")))?;
         ToolOutput::new(&change)
+    }
+}
+
+fn fix_not_found(err: CliError, fix: String) -> ToolError {
+    let not_found = matches!(err, CliError::NotFound(_));
+    let error = ToolError::from(err);
+    if not_found {
+        error.with_fix(fix)
+    } else {
+        error
     }
 }
 
@@ -351,6 +349,38 @@ mod tests {
         let r = call(&t, CLOSE, json!({"door": "garage"}));
         let change = assert_fits(&t, CLOSE, &r);
         assert!(change["door"].get("serial").is_none());
+    }
+
+    /// `doors` answers with this error, the way the phone module would.
+    struct NoDoors(fn() -> CliError);
+
+    impl Source for NoDoors {
+        async fn doors(&self) -> Result<Vec<Door>, CliError> {
+            Err((self.0)())
+        }
+        async fn open_app(&self) -> Result<usize, CliError> {
+            Ok(0)
+        }
+        async fn set_door(&self, _: &str, _: DoorCommand) -> Result<DoorChange, CliError> {
+            Err((self.0)())
+        }
+    }
+
+    #[test]
+    fn only_a_door_missing_from_the_screen_points_at_the_app_tool() {
+        let missing = MyqTools {
+            source: NoDoors(|| CliError::NotFound("dummy".into())),
+        };
+        let r = call(&missing, DOORS, json!({}));
+        assert!(r.is_error());
+        assert!(r.text().contains(APP_OPEN), "{}", r.text());
+
+        let unreadable = MyqTools {
+            source: NoDoors(|| CliError::Upstream("dummy".into())),
+        };
+        let r = call(&unreadable, DOORS, json!({}));
+        assert!(r.is_error());
+        assert!(!r.text().contains(APP_OPEN), "{}", r.text());
     }
 
     #[test]

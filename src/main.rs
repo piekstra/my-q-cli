@@ -33,7 +33,8 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// The myQ account to act on, when the login has more than one (id or name).
+    /// The myQ account to act on with the cloud API (id or name). `doors` without --cloud
+    /// and `mcp` act on the account the phone's app is signed in to, and refuse this.
     #[arg(short, long, global = true, env = "MYQ_ACCOUNT")]
     account: Option<String>,
 
@@ -145,7 +146,7 @@ enum DevicesCmd {
 
 #[derive(clap::Args, Debug)]
 struct MoveArgs {
-    /// Door name, serial number, or a unique part of its name.
+    /// Door name, or a unique part of it. A serial number works only with --cloud.
     door: String,
     /// Skip the confirmation prompt (required when non-interactive).
     #[arg(long)]
@@ -174,7 +175,7 @@ enum DoorsCmd {
     List,
     /// Show one door (door/v1).
     Get {
-        /// Door name, serial number, or a unique part of its name.
+        /// Door name, or a unique part of it. A serial number works only with --cloud.
         door: String,
     },
     /// Open a door, and report what a read-back shows (door-change/v1).

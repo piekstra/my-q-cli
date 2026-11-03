@@ -345,18 +345,28 @@ fn door_cards<P: Phone>(phone: &P, sleep: &dyn Fn(Duration)) -> Result<Vec<Card>
         Screen::OtherApp => Err(CliError::Upstream(
             "the myQ app did not come to the phone's screen. Unlock the phone and try again".into(),
         )),
-        Screen::Unreadable => Err(CliError::Upstream(
-            "the phone's screen could not be read. Try again".into(),
-        )),
+        Screen::Unreadable => Err(unreadable()),
     }
 }
 
-/// One read that changes nothing on the phone. `None` when no door is on its screen.
-pub fn doors_on_screen<P: Phone>(phone: &P) -> Result<Option<Vec<Door>>, CliError> {
-    Ok(match parse_screen(&phone.screen_xml()?) {
-        Screen::Doors(cards) => Some(cards.into_iter().map(|card| card.door).collect()),
-        _ => None,
-    })
+fn unreadable() -> CliError {
+    CliError::Upstream(
+        "the phone's screen could not be read, which a moving door can cause. Try again".into(),
+    )
+}
+
+/// One read that changes nothing on the phone. `NotFound` means bringing the app
+/// forward could help, which an unreadable screen does not.
+pub fn doors_on_screen<P: Phone>(phone: &P) -> Result<Vec<Door>, CliError> {
+    match parse_screen(&phone.screen_xml()?) {
+        Screen::Doors(cards) => Ok(cards.into_iter().map(|card| card.door).collect()),
+        Screen::Unreadable => Err(unreadable()),
+        Screen::AppWithoutDoors | Screen::OtherApp => Err(CliError::NotFound(
+            "no door is on the phone's screen: the myQ app is not in front, or is off its Home \
+             tab"
+            .into(),
+        )),
+    }
 }
 
 /// The doors, bringing the app to the phone's screen if they are not on it.
@@ -652,13 +662,24 @@ mod tests {
     #[test]
     fn reading_the_screen_alone_changes_nothing_on_the_phone() {
         let fake = Fake::new(&[other_app()]);
-        assert_eq!(doors_on_screen(&fake).unwrap(), None);
+        let err = doors_on_screen(&fake).unwrap_err();
+        assert_eq!(err.exit_code(), 4);
+        assert!(!err.to_string().contains("dummy private"), "{err}");
         assert_eq!(fake.opened.get(), 0);
 
         let fake = Fake::new(&[HOME.to_string()]);
-        assert_eq!(doors_on_screen(&fake).unwrap().unwrap().len(), 1);
+        assert_eq!(doors_on_screen(&fake).unwrap().len(), 1);
         assert_eq!(fake.opened.get(), 0);
         assert!(fake.taps.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_screen_says_to_try_again_rather_than_to_open_the_app() {
+        let fake = Fake::new(&["ERROR: could not get idle state.".to_string()]);
+        let err = doors_on_screen(&fake).unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("Try again"), "{err}");
+        assert_eq!(fake.opened.get(), 0);
     }
 
     #[test]
