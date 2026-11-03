@@ -67,7 +67,8 @@ enum Command {
     Hub(HubCmd),
     /// Raw myQ API passthrough. Anything but GET needs confirmation.
     Api(RawArgs),
-    /// Serve door tools to Claude and other MCP clients over stdio.
+    /// Serve door tools to Claude and other MCP clients, over stdio. With --http, on 127.0.0.1
+    /// for your own Cloudflare Worker (see README), and read-only unless --allow-writes.
     Mcp(pk_cli_mcp::McpArgs),
     /// Update to the latest release from GitHub.
     SelfUpdate(SelfUpdateArgs),
@@ -83,7 +84,8 @@ enum AuthCmd {
     Login(LoginCmd),
     /// Report the stored credential and session (auth-status/v1). Makes no request.
     Status,
-    /// Clear the session; --forget also removes the password and saved identity.
+    /// Clear the session; --forget also removes the password, the saved identity and the
+    /// `mcp --http` connector token.
     Logout(LogoutArgs),
     /// Replace the stored password without signing in, for rotation or headless setup.
     SetCredential(SetCredentialCmd),
@@ -302,7 +304,7 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             target: env!("BUILD_TARGET").into(),
             current: VERSION.into(),
         }
-        .run(args, json, cli.common.quiet),
+        .run_noting(args, json, cli.common.quiet, &pk_cli_mcp::restart_note(BIN)),
         Command::Completions { shell } => {
             clap_complete::generate(*shell, &mut Cli::command(), BIN, &mut std::io::stdout());
             Ok(())
@@ -323,6 +325,14 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+/// What a failed token delete still leaves true. Nothing, if `mcp --new-token` never ran here.
+fn connector_token_stays(failure: CliError) -> CliError {
+    CliError::Keychain(format!(
+        "the session and config are cleared, but the connector token of `{BIN} mcp --http` could \
+         not be removed, if there is one: {failure}"
+    ))
 }
 
 fn to_value<T: serde::Serialize>(value: &T) -> Result<Value, CliError> {
@@ -457,15 +467,23 @@ fn auth_cmd(cli: &Cli, cmd: &AuthCmd, store: &ConfigStore) -> Result<(), CliErro
             Ok(())
         }
         AuthCmd::Logout(args) => {
+            let mut token_removed = false;
             if args.forget {
                 keychain.delete()?;
+                // Nothing records whether `mcp --new-token` ran, so this read is ungated: a
+                // keyring that is not running, or a prompt declined, must not leave the config.
+                let token = keychain.delete_connector_token();
                 store.clear()?;
+                token_removed = token.map_err(connector_token_stays)?;
             } else if let Some(mut credentials) = keychain.load()? {
                 credentials.sign_out();
                 keychain.save(&credentials)?;
             }
             if !cli.common.quiet {
                 eprintln!("signed out");
+                if token_removed {
+                    eprintln!("{}", myq::credential::server_keeps_its_token());
+                }
             }
             Ok(())
         }
@@ -675,12 +693,12 @@ fn phone_doors_cmd(cli: &Cli, cmd: &DoorsCmd) -> Result<(), CliError> {
     let sleep = &std::thread::sleep;
     match cmd {
         DoorsCmd::List => {
-            let rows = values(&phone::doors(&adb, sleep)?)?;
+            let rows = values(&phone::doors(&adb, sleep, None)?)?;
             output::emit_list(json, "door", rows, &["name", "state", "status"]);
             Ok(())
         }
         DoorsCmd::Get { door } => {
-            let doors = phone::doors(&adb, sleep)?;
+            let doors = phone::doors(&adb, sleep, None)?;
             output::emit_one(json, "door", to_value(myq::door::find(&doors, door)?)?);
             Ok(())
         }
@@ -690,11 +708,11 @@ fn phone_doors_cmd(cli: &Cli, cmd: &DoorsCmd) -> Result<(), CliError> {
             } else {
                 DoorCommand::Close
             };
-            let doors = phone::doors(&adb, sleep)?;
+            let doors = phone::doors(&adb, sleep, None)?;
             let door = myq::door::find(&doors, &args.door)?;
             confirm_move(args, door, command)?;
             // A fresh read inside: a prompt can sit for as long as the person likes.
-            let change = phone::set_door(&adb, &door.name, command, move_wait(args), sleep)?;
+            let change = phone::set_door(&adb, &door.name, command, move_wait(args), sleep, None)?;
             emit_change(cli, &change);
             Ok(())
         }

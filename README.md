@@ -6,7 +6,7 @@ myQ.
 
 Conforms to the [`piekstra-cli` spec v1](https://github.com/piekstra/cli-common).
 
-> **Status: v0.1.1. Reading a door works; moving one is untested.** myQ's cloud API
+> **Status: v0.2.0. Reading a door works; moving one is untested.** myQ's cloud API
 > refuses this tool: after a real password and one-time code, its gateway answers the
 > token exchange with `401.122`, because the request has no Firebase App Check
 > attestation. Only myQ's own app can provide one, and this tool does not fake it. So
@@ -87,7 +87,7 @@ could only send more codes or lock the account.
 | `myq accounts list`, `accounts use <account>` | The accounts this login can act on |
 | `myq hub status --host <address>` | The opener's Wi-Fi status, read directly over the home network |
 | `myq api <METHOD> <PATH>` | Raw API passthrough; anything but GET asks first |
-| `myq mcp` | Door tools for MCP clients, over stdio |
+| `myq mcp` | Door tools for MCP clients, over stdio; `--http` serves them to your own Worker |
 | `myq auth login\|status\|logout\|set-credential` | The stored credential |
 | `myq config`, `info`, `completions`, `self-update` | The family's standard commands |
 
@@ -111,7 +111,8 @@ once.
 
 The door button is tapped only when the screen read just before it shows exactly one door,
 at rest, in the opposite state. A door that is moving, offline or in a state `myq` does not
-recognise gets no tap, because a tap mid-travel could stop or reverse it. Nothing taps twice.
+recognise gets no tap, because a tap mid-travel could stop or reverse it. No command taps twice,
+and while one is running, a second, from a terminal or a server, is refused with nothing tapped.
 
 Opening a garage door exposes the house, and closing one can hit whatever is under it.
 Make sure you can see the door, or that you mean it.
@@ -126,8 +127,38 @@ it forward.
 | Client | How |
 | --- | --- |
 | Claude Code | `claude mcp add myq -- myq mcp` |
-| Claude Desktop | Install `myq-<version>.mcpb` from a release (none published yet) |
-| claude.ai on the web and mobile | Not built yet |
+| Claude Desktop | Install `myq-<version>.mcpb` from the [latest release](https://github.com/piekstra/my-q-cli/releases/latest) |
+| claude.ai on the web and mobile | `myq mcp --http`, below |
+
+A door tool's read-back waits up to 45 seconds for the door. A call that has not reached the door's
+button 30 seconds after it began taps nothing and says so, as does one that would bring the app
+forward by then, so a door cannot move after whoever asked has stopped waiting. That holds through a
+Mac asleep: it checks the wall clock as well as the monotonic one.
+
+**Claude on the web and mobile.** claude.ai reaches tools through a remote connector, so `myq` serves
+them from the computer the phone is connected to, to a connector you deploy into your own Cloudflare
+account:
+
+```console
+$ myq mcp --new-token            # once: a bearer token, saved in the keychain and printed for the Worker
+$ myq mcp --http --port 8763     # serve on 127.0.0.1 only
+```
+
+The connector, [cli-common's `connector/`](https://github.com/piekstra/cli-common/tree/main/connector#tools-from-your-computer-home-modules),
+reaches that port through a Cloudflare Tunnel in your account; its README walks through the tunnel,
+the VPC service, a launchd agent that keeps the server running, and the `HOME_MYQ_TOKEN` secret, with
+the threat model. `--http` binds 127.0.0.1 only, refuses to start without the token, and refuses any
+request whose `Host` is not loopback or that carries an `Origin`.
+
+It serves `myq_doors` only. `--allow-writes` adds `myq_app_open`, `myq_door_open` and `myq_door_close`,
+and then **anyone holding the token can open your garage door through your Worker**, with no prompt
+unless the client asks for one, and with nobody necessarily able to see the door. Leave it off unless
+you want that. Tool results do not stay on your computer: your door's name and state pass through
+Cloudflare and reach Claude ([`SECURITY.md`](SECURITY.md)). While the computer sleeps, the tools answer
+that it is offline.
+
+After `myq self-update`, restart the server: a running one keeps the old code, and its launchd agent
+restarts it only when it exits. Its start line names the version.
 
 ## Documentation
 

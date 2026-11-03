@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "myq",
   "display_name": "myQ garage door (myq)",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Read and move your own myQ garage doors, through the open-source myq CLI.",
   "long_description": "Ask Claude whether a garage door is open, and have it open or close one. It operates the myQ app on your Android phone over adb, so this computer needs adb and the phone must be connected, unlocked and signed in to myQ. Unofficial; not affiliated with Chamberlain Group or myQ.",
   "author": {
