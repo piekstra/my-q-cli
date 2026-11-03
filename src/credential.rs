@@ -184,13 +184,18 @@ impl KeychainStore {
 
 /// What `auth logout --forget` owes whoever ran it, having removed a connector token: the door tools
 /// use the phone and not the session, so a running server still answers once they are signed out.
+/// Only macOS has one command to give, as with `pk_cli_mcp::restart_note`.
 pub fn server_keeps_its_token() -> String {
     let bin = crate::BIN;
-    format!(
+    let warning = format!(
         "`{bin} mcp --http` keeps the token it started with until it stops, and one started with \
-         --allow-writes can still move a door. To stop it: launchctl bootout \
-         gui/$(id -u)/com.piekstra.{bin}-mcp-http"
-    )
+         --allow-writes can still move a door."
+    );
+    if cfg!(target_os = "macos") {
+        format!("{warning} To stop it: launchctl bootout gui/$(id -u)/com.piekstra.{bin}-mcp-http")
+    } else {
+        format!("{warning} To end that, stop the server.")
+    }
 }
 
 impl Default for KeychainStore {
@@ -219,8 +224,14 @@ mod tests {
         assert!(note.contains("myq mcp --http"), "{note}");
         assert!(note.contains("--allow-writes"), "{note}");
         assert!(note.contains("can still move a door"), "{note}");
-        assert!(
+        assert_eq!(
             note.contains("launchctl bootout gui/$(id -u)/com.piekstra.myq-mcp-http"),
+            cfg!(target_os = "macos"),
+            "{note}"
+        );
+        assert_eq!(
+            note.contains("launchctl"),
+            cfg!(target_os = "macos"),
             "{note}"
         );
     }

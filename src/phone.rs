@@ -501,9 +501,11 @@ fn move_door<P: Phone>(
             )));
         };
         check_in_time(deadline)?;
-        phone
-            .tap(x, y)
-            .map_err(|err| tap_unknown(&door.name, err))?;
+        if let Err(err) = phone.tap(x, y) {
+            // It may have landed, so the lock outlasts the app's lag here too.
+            sleep(wait.interval);
+            return Err(tap_unknown(&door.name, err));
+        }
     }
 
     let name = door.name.clone();
@@ -987,6 +989,20 @@ pub(crate) mod tests {
             assert!(!change.confirmed);
             assert_eq!(slept.into_inner(), naps);
         }
+    }
+
+    #[test]
+    fn a_failed_tap_holds_the_lock_one_interval() {
+        let mut fake = Fake::new(&[HOME.to_string()]);
+        fake.tap_fails = true;
+        let slept = RefCell::new(Vec::new());
+        let wait = Wait {
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(3),
+        };
+        let nap = |nap| slept.borrow_mut().push(nap);
+        assert!(set_door(&fake, "garage", DoorCommand::Open, wait, &nap, None).is_err());
+        assert_eq!(slept.into_inner(), [Duration::from_secs(3)]);
     }
 
     #[test]
