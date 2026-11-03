@@ -10,7 +10,8 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
   physically moves and exposes the house. A previous approval does not carry over.
 - **A connected phone is a real door.** Tests never reach one: door logic goes through the
   `phone::Phone` seam, and `tests/cli_surface.rs` points `MYQ_ADB` at nothing. A screen read
-  from another app is dropped after its package name and never printed or kept.
+  from another app is dropped after its package name and never printed or kept. `myq_doors`
+  stays read-only: bringing the app forward changes the phone, so it is `myq_app_open`'s job.
 - **API facts come only from the myQ Android app**: its APK or its captured traffic.
   Do not read other myQ integrations, and do not copy their endpoints or flows. Label
   each fact's source in `docs/api.md`.

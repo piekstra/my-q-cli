@@ -15,10 +15,9 @@ use std::time::{Duration, Instant};
 
 use pk_cli_core::CliError;
 
-use crate::client::Wait;
-use crate::door::{self, Door, DoorChange, DoorCommand};
+use crate::door::{self, Door, DoorChange, DoorCommand, Wait};
 
-pub const PACKAGE: &str = "com.chamberlain.android.liftmaster.myq";
+const PACKAGE: &str = "com.chamberlain.android.liftmaster.myq";
 /// Names the adb program, overriding the search of the usual SDK locations.
 pub const ENV_ADB: &str = "MYQ_ADB";
 
@@ -163,7 +162,9 @@ fn adb_failure(stderr: &str) -> CliError {
         CliError::Usage(
             "more than one Android device is connected: name one with ANDROID_SERIAL".into(),
         )
-    } else if text.contains("no devices") || text.contains("offline") || text.contains("not found")
+    } else if text.contains("no devices")
+        || text.contains("device offline")
+        || (text.contains("device '") && text.contains("not found"))
     {
         CliError::Upstream(
             "no phone is connected: plug it in over USB or use wireless debugging, and allow \
@@ -178,13 +179,13 @@ fn adb_failure(stderr: &str) -> CliError {
 
 /// One door as the app's home screen shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Card {
-    pub door: Door,
+struct Card {
+    door: Door,
     button: Option<(u32, u32)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Screen {
+enum Screen {
     Doors(Vec<Card>),
     AppWithoutDoors,
     OtherApp,
@@ -193,7 +194,7 @@ pub enum Screen {
     Unreadable,
 }
 
-pub fn parse_screen(xml: &str) -> Screen {
+fn parse_screen(xml: &str) -> Screen {
     let nodes: Vec<Vec<(String, String)>> = node_tags(xml).iter().map(|t| attributes(t)).collect();
     if nodes.is_empty() {
         return Screen::Unreadable;
@@ -208,7 +209,7 @@ pub fn parse_screen(xml: &str) -> Screen {
             "device_name" => cards.push(Card {
                 door: Door {
                     name: attr(node, "text").unwrap_or_default().to_string(),
-                    serial: String::new(),
+                    serial: None,
                     state: "unknown".into(),
                     online: None,
                     last_update: None,
@@ -350,6 +351,15 @@ fn door_cards<P: Phone>(phone: &P, sleep: &dyn Fn(Duration)) -> Result<Vec<Card>
     }
 }
 
+/// One read that changes nothing on the phone. `None` when no door is on its screen.
+pub fn doors_on_screen<P: Phone>(phone: &P) -> Result<Option<Vec<Door>>, CliError> {
+    Ok(match parse_screen(&phone.screen_xml()?) {
+        Screen::Doors(cards) => Some(cards.into_iter().map(|card| card.door).collect()),
+        _ => None,
+    })
+}
+
+/// The doors, bringing the app to the phone's screen if they are not on it.
 pub fn doors<P: Phone>(phone: &P, sleep: &dyn Fn(Duration)) -> Result<Vec<Door>, CliError> {
     Ok(door_cards(phone, sleep)?
         .into_iter()
@@ -404,7 +414,9 @@ pub fn set_door<P: Phone>(
                 door.name
             )));
         };
-        phone.tap(x, y)?;
+        phone
+            .tap(x, y)
+            .map_err(|err| tap_unknown(&door.name, err))?;
     }
 
     let name = door.name.clone();
@@ -415,16 +427,17 @@ pub fn set_door<P: Phone>(
         confirmed,
     };
     if wait.timeout.is_zero() {
-        let read = read_door(phone, &name).unwrap_or(latest);
+        let read = read_door(phone, &name).unwrap_or(Door {
+            state: "unknown".into(),
+            status: None,
+            ..latest
+        });
         let confirmed = read.state == command.target();
         return Ok(reached(read, confirmed));
     }
-    let tries = wait
-        .timeout
-        .as_millis()
-        .div_ceil(wait.interval.as_millis().max(1))
-        .max(1);
-    for _ in 0..tries {
+    // By the clock, not a count of polls: one read can take as long as `ADB_TIMEOUT`.
+    let started = Instant::now();
+    while started.elapsed() < wait.timeout {
         sleep(wait.interval);
         if let Some(read) = read_door(phone, &name) {
             latest = read;
@@ -442,8 +455,21 @@ pub fn set_door<P: Phone>(
         "{opening} `{name}` last read `{}` after {} seconds. Check the door before sending it \
          again",
         latest.status.as_deref().unwrap_or(&latest.state),
-        wait.timeout.as_secs()
+        started.elapsed().as_secs()
     )))
+}
+
+/// A failed `input tap` may still have reached the phone, so this must not read as
+/// nothing having happened.
+fn tap_unknown(name: &str, err: CliError) -> CliError {
+    let text = format!(
+        "The tap on `{name}`'s door button may have reached the phone, so the door may be \
+         moving. Check it before trying again. {err}"
+    );
+    match err {
+        CliError::Auth(_) => CliError::Auth(text),
+        _ => CliError::Upstream(text),
+    }
 }
 
 fn read_door<P: Phone>(phone: &P, name: &str) -> Option<Door> {
@@ -473,6 +499,9 @@ mod tests {
         screens: RefCell<VecDeque<String>>,
         taps: RefCell<Vec<(u32, u32)>>,
         opened: Cell<u32>,
+        reads: Cell<u32>,
+        read_delay: Duration,
+        tap_fails: bool,
     }
 
     impl Fake {
@@ -481,12 +510,17 @@ mod tests {
                 screens: RefCell::new(screens.iter().cloned().collect()),
                 taps: RefCell::default(),
                 opened: Cell::new(0),
+                reads: Cell::new(0),
+                read_delay: Duration::ZERO,
+                tap_fails: false,
             }
         }
     }
 
     impl Phone for Fake {
         fn screen_xml(&self) -> Result<String, CliError> {
+            self.reads.set(self.reads.get() + 1);
+            std::thread::sleep(self.read_delay);
             let mut screens = self.screens.borrow_mut();
             let next = if screens.len() > 1 {
                 screens.pop_front()
@@ -503,6 +537,9 @@ mod tests {
 
         fn tap(&self, x: u32, y: u32) -> Result<(), CliError> {
             self.taps.borrow_mut().push((x, y));
+            if self.tap_fails {
+                return Err(CliError::Upstream("adb did not answer".into()));
+            }
             Ok(())
         }
     }
@@ -610,6 +647,18 @@ mod tests {
         assert_eq!(doors[0].state, "closed");
         assert!(fake.taps.borrow().is_empty());
         assert_eq!(fake.opened.get(), 0, "the app was already in front");
+    }
+
+    #[test]
+    fn reading_the_screen_alone_changes_nothing_on_the_phone() {
+        let fake = Fake::new(&[other_app()]);
+        assert_eq!(doors_on_screen(&fake).unwrap(), None);
+        assert_eq!(fake.opened.get(), 0);
+
+        let fake = Fake::new(&[HOME.to_string()]);
+        assert_eq!(doors_on_screen(&fake).unwrap().unwrap().len(), 1);
+        assert_eq!(fake.opened.get(), 0);
+        assert!(fake.taps.borrow().is_empty());
     }
 
     #[test]
@@ -736,6 +785,29 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_tap_says_the_door_may_be_moving_and_is_not_retried() {
+        let mut fake = Fake::new(&[HOME.to_string()]);
+        fake.tap_fails = true;
+        let err = set(&fake, DoorCommand::Open).unwrap_err();
+        assert_eq!(err.exit_code(), 5);
+        let text = err.to_string();
+        assert!(text.contains("may be moving") && text.contains("adb did not answer"));
+        assert_eq!(fake.taps.borrow().len(), 1);
+    }
+
+    #[test]
+    fn the_wait_ends_at_its_deadline_however_slow_the_reads() {
+        let mut fake = Fake::new(&[HOME.to_string(), reading("Opening")]);
+        fake.read_delay = Duration::from_millis(20);
+        let wait = Wait {
+            timeout: Duration::from_millis(30),
+            interval: Duration::from_millis(1),
+        };
+        set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}).unwrap_err();
+        assert!(fake.reads.get() <= 5, "{} reads", fake.reads.get());
+    }
+
+    #[test]
     fn a_stalled_door_that_got_no_tap_does_not_claim_one() {
         let fake = Fake::new(&[reading("Opening")]);
         let err = set(&fake, DoorCommand::Open).unwrap_err();
@@ -771,6 +843,19 @@ mod tests {
     }
 
     #[test]
+    fn no_wait_with_a_lost_read_does_not_repeat_the_old_state() {
+        let wait = Wait {
+            timeout: Duration::ZERO,
+            interval: Duration::from_millis(10),
+        };
+        let fake = Fake::new(&[HOME.to_string(), other_app()]);
+        let change = set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}).unwrap();
+        assert!(change.changed && !change.confirmed);
+        assert_eq!(change.door.state, "unknown");
+        assert_eq!(change.door.status, None);
+    }
+
+    #[test]
     fn adb_failures_say_what_to_do() {
         for (stderr, code, expected) in [
             ("error: no devices/emulators found", 5, "no phone"),
@@ -779,6 +864,12 @@ mod tests {
             ("error: device unauthorized.", 3, "USB debugging"),
             ("error: more than one device/emulator", 2, "ANDROID_SERIAL"),
             ("error: dummy reason", 5, "dummy reason"),
+            (
+                "Error: Activity class {dummy/dummy} does not exist.",
+                5,
+                "adb failed",
+            ),
+            ("/system/bin/sh: input: not found", 5, "adb failed"),
         ] {
             let err = adb_failure(stderr);
             assert_eq!(err.exit_code(), code, "{stderr}");

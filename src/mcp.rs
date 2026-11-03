@@ -10,11 +10,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::client::{Wait, POLL_INTERVAL};
-use crate::door::{Door, DoorChange, DoorCommand};
+use crate::door::{Door, DoorChange, DoorCommand, Wait, POLL_INTERVAL};
 use crate::phone::{self, Adb};
 
 const DOORS: &str = "myq_doors";
+const APP_OPEN: &str = "myq_app_open";
 const OPEN: &str = "myq_door_open";
 const CLOSE: &str = "myq_door_close";
 
@@ -25,6 +25,8 @@ const TOOL_WAIT: Duration = Duration::from_secs(45);
 #[allow(async_fn_in_trait)] // no Send bound: the executor polls on the calling thread
 pub trait Source {
     async fn doors(&self) -> Result<Vec<Door>, CliError>;
+    /// Bring the app to the phone's screen; how many doors it then shows.
+    async fn open_app(&self) -> Result<usize, CliError>;
     async fn set_door(&self, door: &str, command: DoorCommand) -> Result<DoorChange, CliError>;
 }
 
@@ -33,7 +35,16 @@ pub struct PhoneApp;
 
 impl Source for PhoneApp {
     async fn doors(&self) -> Result<Vec<Door>, CliError> {
-        phone::doors(&Adb::locate(), &std::thread::sleep)
+        phone::doors_on_screen(&Adb::locate())?.ok_or_else(|| {
+            CliError::Upstream(format!(
+                "No door is on the phone's screen: the myQ app is not in front, or is off its \
+                 Home tab. Call {APP_OPEN} to bring it forward"
+            ))
+        })
+    }
+
+    async fn open_app(&self) -> Result<usize, CliError> {
+        Ok(phone::doors(&Adb::locate(), &std::thread::sleep)?.len())
     }
 
     async fn set_door(&self, door: &str, command: DoorCommand) -> Result<DoorChange, CliError> {
@@ -70,6 +81,16 @@ pub struct DoorArgs {
     pub door: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AppOpenArgs {}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct AppOpened {
+    /// How many doors the app's screen shows.
+    pub doors: usize,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct DoorItem {
     pub name: String,
@@ -94,9 +115,7 @@ impl DoorItem {
             state: door.state,
             online: door.online,
             status: door.status,
-            serial: detailed
-                .then_some(door.serial)
-                .filter(|serial| !serial.is_empty()),
+            serial: if detailed { door.serial } else { None },
             last_update: if detailed { door.last_update } else { None },
         }
     }
@@ -138,13 +157,26 @@ impl<S: Source> Toolset for MyqTools<S> {
                 DOORS,
                 "List garage doors",
                 "Lists the garage doors in the myQ app on the user's phone with their current \
-                 state, bringing the app to the phone's screen if another app is in front. Use it \
-                 to answer whether a door is open, and to find the name the door tools take. \
-                 Returns items with name, state and status (the app's wording, such as Closed for \
-                 14 minutes), plus returned and next_cursor. Narrow with state.",
+                 state, changing nothing on the phone. Use it to answer whether a door is open, \
+                 and to find the name the door tools take. If the app is not showing its doors, \
+                 the error says to call myq_app_open. Returns items with name, state and status \
+                 (the app's wording, such as Closed for 14 minutes), plus returned and \
+                 next_cursor. Narrow with state.",
             )
             .input::<DoorsArgs>()
             .output::<Page<DoorItem>>(),
+            ToolDef::write(
+                APP_OPEN,
+                "Show the myQ app on the phone",
+                "Brings the myQ app to the screen of the user's phone, replacing whatever they \
+                 have open, and leaves it there. It never touches a door. Use it only when \
+                 myq_doors reports that no door is on the phone's screen. Returns doors, the \
+                 number of doors the app then shows. Fails if the phone is locked.",
+                false,
+            )
+            .idempotent(true)
+            .input::<AppOpenArgs>()
+            .output::<AppOpened>(),
             ToolDef::write(
                 OPEN,
                 "Open a garage door",
@@ -167,6 +199,12 @@ impl<S: Source> Toolset for MyqTools<S> {
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, ToolError> {
         match name {
             DOORS => self.doors(parse_args(args)?).await,
+            APP_OPEN => {
+                let _: AppOpenArgs = parse_args(args)?;
+                ToolOutput::new(&AppOpened {
+                    doors: self.source.open_app().await?,
+                })
+            }
             OPEN => self.set(parse_args(args)?, DoorCommand::Open).await,
             CLOSE => self.set(parse_args(args)?, DoorCommand::Close).await,
             other => Err(ToolError::other(format!("no handler for {other}"))),
@@ -238,6 +276,9 @@ mod tests {
         async fn doors(&self) -> Result<Vec<Door>, CliError> {
             Ok(fixture_doors())
         }
+        async fn open_app(&self) -> Result<usize, CliError> {
+            Ok(fixture_doors().len())
+        }
         async fn set_door(
             &self,
             query: &str,
@@ -248,7 +289,7 @@ mod tests {
             self.sent
                 .lock()
                 .unwrap()
-                .push((found.serial.clone(), command.path()));
+                .push((found.serial.clone().unwrap_or_default(), command.path()));
             let mut moved = found.clone();
             moved.state = command.target().to_string();
             Ok(DoorChange {
@@ -265,6 +306,62 @@ mod tests {
                 sent: Mutex::new(Vec::new()),
             },
         }
+    }
+
+    /// A door as the phone's screen shows it: no serial, the app's own wording.
+    struct PhoneShaped;
+
+    fn phone_door() -> Door {
+        Door {
+            name: "Dummy Garage".into(),
+            serial: None,
+            state: "closed".into(),
+            online: None,
+            last_update: None,
+            status: Some("Closed for 14 minutes".into()),
+        }
+    }
+
+    impl Source for PhoneShaped {
+        async fn doors(&self) -> Result<Vec<Door>, CliError> {
+            Ok(vec![phone_door()])
+        }
+        async fn open_app(&self) -> Result<usize, CliError> {
+            Ok(1)
+        }
+        async fn set_door(&self, _: &str, _: DoorCommand) -> Result<DoorChange, CliError> {
+            Ok(DoorChange {
+                door: phone_door(),
+                changed: false,
+                confirmed: true,
+            })
+        }
+    }
+
+    #[test]
+    fn a_door_from_the_phone_fits_every_tool_without_a_serial() {
+        let t = MyqTools {
+            source: PhoneShaped,
+        };
+        let r = call(&t, DOORS, json!({}));
+        let page = assert_fits(&t, DOORS, &r);
+        assert!(page["items"][0].get("serial").is_none());
+        assert_eq!(page["items"][0]["status"], "Closed for 14 minutes");
+
+        let r = call(&t, CLOSE, json!({"door": "garage"}));
+        let change = assert_fits(&t, CLOSE, &r);
+        assert!(change["door"].get("serial").is_none());
+    }
+
+    #[test]
+    fn showing_the_app_is_a_write_that_reports_its_doors_and_doors_is_a_read() {
+        let t = tools();
+        let r = call(&t, APP_OPEN, json!({}));
+        assert_eq!(assert_fits(&t, APP_OPEN, &r)["doors"], 2);
+        let tool = |name: &str| t.tools().into_iter().find(|d| d.name == name).unwrap();
+        assert!(!tool(APP_OPEN).annotations.read_only);
+        assert!(!tool(APP_OPEN).annotations.destructive);
+        assert!(tool(DOORS).annotations.read_only);
     }
 
     #[test]

@@ -42,6 +42,10 @@
       "description": "Your garage doors and whether each is open or closed."
     },
     {
+      "name": "myq_app_open",
+      "description": "Bring the myQ app to your phone's screen, so its doors can be read."
+    },
+    {
       "name": "myq_door_open",
       "description": "Open a garage door, and report what a read-back shows."
     },

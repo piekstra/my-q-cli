@@ -1,10 +1,21 @@
 //! myQ's JSON → the DTOs this CLI prints. A door is any device whose state
 //! carries `door_state`: that field is what the app itself reads.
 
+use std::time::Duration;
+
 use pk_cli_core::{resolve, CliError};
 use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::Value;
+
+pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How long a door command waits for the read-back to show the target state.
+#[derive(Debug, Clone, Copy)]
+pub struct Wait {
+    pub timeout: Duration,
+    pub interval: Duration,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoorCommand {
@@ -47,9 +58,9 @@ pub struct Account {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct Door {
     pub name: String,
-    /// Empty for a door read from the phone's screen, which does not show one.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub serial: String,
+    /// Absent for a door read from the phone's screen, which does not show one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
     /// myQ's own `door_state`, e.g. `open`, `closed`, `opening`, `closing`.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -147,7 +158,7 @@ pub fn doors_from(value: &Value) -> Vec<Door> {
             let state = d.get("state")?;
             Some(Door {
                 name: text(d, "name").unwrap_or_default(),
-                serial: text(d, "serial_number")?,
+                serial: Some(text(d, "serial_number")?),
                 state: text(state, "door_state")?,
                 online: state.get("online").and_then(Value::as_bool),
                 last_update: text(state, "last_update"),
@@ -163,13 +174,7 @@ pub fn find<'a>(doors: &'a [Door], query: &str) -> Result<&'a Door, CliError> {
     resolve::pick(
         doors,
         query,
-        |d| {
-            if d.serial.is_empty() {
-                Vec::new()
-            } else {
-                vec![d.serial.clone()]
-            }
-        },
+        |d| d.serial.iter().cloned().collect(),
         |d| &d.name,
         "door",
     )

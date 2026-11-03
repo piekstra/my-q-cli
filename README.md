@@ -113,8 +113,10 @@ Make sure you can see the door, or that you mean it.
 
 ## Use with Claude
 
-The tools are `myq_doors`, `myq_door_open` and `myq_door_close`. They work through the
-phone, so [set it up](#set-up-your-phone) first, on the computer running the client.
+The tools are `myq_doors`, `myq_app_open`, `myq_door_open` and `myq_door_close`. They work
+through the phone, so [set it up](#set-up-your-phone) first, on the computer running the
+client. `myq_doors` only reads, so if the app is not showing its doors, `myq_app_open` brings
+it forward.
 
 | Client | How |
 | --- | --- |

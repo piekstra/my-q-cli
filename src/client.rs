@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::auth::{self, Begun, Pkce, Tokens};
 use crate::credential::{Credentials, TokenStore};
-use crate::door::{self, Account, Device, Door, DoorChange, DoorCommand};
+use crate::door::{self, Account, Device, Door, DoorChange, DoorCommand, Wait};
 
 pub const ACCOUNTS: &str = "https://accounts.myq-cloud.com";
 pub const DEVICES: &str = "https://devices.myq-cloud.com";
@@ -19,7 +19,6 @@ pub const API_VERSION: &str = "v6.0";
 
 /// Renew this long before the token runs out, so no request races its expiry.
 const EXPIRY_MARGIN_SECS: u64 = 60;
-pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Refresh tokens may rotate, so two parallel MCP calls must not spend the same one.
 /// Another process can still spend it first, which `renew` checks for.
@@ -30,13 +29,6 @@ pub fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// How long a door command waits for the read-back to show the target state.
-#[derive(Debug, Clone, Copy)]
-pub struct Wait {
-    pub timeout: Duration,
-    pub interval: Duration,
 }
 
 pub struct Client<T, S> {
@@ -250,7 +242,10 @@ impl<T: Transport, S: TokenStore> Client<T, S> {
                     door.name
                 )));
             }
-            self.door_command(account, &door.serial, command).await?;
+            let serial = door.serial.as_deref().ok_or_else(|| {
+                CliError::Upstream(format!("myQ listed `{}` with no serial number", door.name))
+            })?;
+            self.door_command(account, serial, command).await?;
         }
 
         let name = door.name.clone();
@@ -498,6 +493,7 @@ pub mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+    use crate::door::POLL_INTERVAL;
     use pk_cli_core::block_on;
 
     const TOKEN: &str = include_str!("../tests/fixtures/token.json");

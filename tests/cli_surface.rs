@@ -129,6 +129,22 @@ fn doors_without_adb_name_what_to_install() {
 }
 
 #[test]
+fn an_account_selector_is_refused_where_the_phone_would_ignore_it() {
+    for args in [
+        &["--account", "dummy", "doors", "list"][..],
+        &["--account", "dummy", "doors", "open", "Left", "--force"][..],
+        &["--account", "dummy", "mcp"][..],
+    ] {
+        let out = myq().args(args).arg("--json").assert().code(2);
+        let v: serde_json::Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cloud API"));
+    }
+}
+
+#[test]
 fn a_write_through_api_without_force_exits_6() {
     myq()
         .args(["--json", "api", "PUT", "/api/v6.0/x"])

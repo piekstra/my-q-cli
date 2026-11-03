@@ -16,10 +16,10 @@ use pk_cli_selfupdate::{SelfUpdateArgs, Updater};
 use serde_json::{json, Value};
 
 use myq::auth;
-use myq::client::{self, unix_now, Client, Wait, POLL_INTERVAL};
+use myq::client::{self, unix_now, Client};
 use myq::config::Config;
 use myq::credential::{Credentials, KeychainStore, TokenStore, ENV_EMAIL};
-use myq::door::{Door, DoorChange, DoorCommand};
+use myq::door::{Door, DoorChange, DoorCommand, Wait, POLL_INTERVAL};
 use myq::phone::{self, Adb};
 use myq::signin::{self, Prompting, Started};
 use myq::{hub, mcp, BIN, VERSION};
@@ -291,7 +291,10 @@ fn run(cli: &Cli) -> Result<(), CliError> {
             Ok(())
         }
         Command::Api(args) => raw_cmd(cli, args),
-        Command::Mcp(args) => mcp::serve(args),
+        Command::Mcp(args) => {
+            refuse_account(cli)?;
+            mcp::serve(args)
+        }
         Command::SelfUpdate(args) => Updater {
             repo: REPO.into(),
             binary: BIN.into(),
@@ -555,9 +558,24 @@ fn accounts_cmd(cli: &Cli, cmd: &AccountsCmd, store: &ConfigStore) -> Result<(),
     }
 }
 
+/// The phone acts on the account its app is signed in to, so a selector could only mislead.
+fn refuse_account(cli: &Cli) -> Result<(), CliError> {
+    if cli.account.is_some() {
+        return Err(CliError::Usage(
+            "--account and MYQ_ACCOUNT apply only to the cloud API: the phone acts on the \
+             account its app is signed in to"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn doors_cmd(cli: &Cli, args: &DoorsArgs, store: &ConfigStore) -> Result<(), CliError> {
     let cmd = &args.cmd;
     let json = cli.common.json;
+    if !args.cloud {
+        refuse_account(cli)?;
+    }
     // The gate comes first: a driver that forgot --force exits 6 before any
     // keychain or network work (SPEC §1.3).
     if let DoorsCmd::Open(args) | DoorsCmd::Close(args) = cmd {
@@ -626,8 +644,8 @@ fn emit_change(cli: &Cli, change: &DoorChange) {
         "changed": change.changed,
         "confirmed": change.confirmed,
     });
-    if !change.door.serial.is_empty() {
-        row["serial"] = json!(change.door.serial);
+    if let Some(serial) = &change.door.serial {
+        row["serial"] = json!(serial);
     }
     output::emit_one(cli.common.json, "door-change", row);
 }
@@ -643,8 +661,9 @@ fn move_door(
     let door = myq::door::find(&doors, &args.door)?;
     confirm_move(args, door, command)?;
     let wait = move_wait(args);
+    let query = door.serial.as_deref().unwrap_or(&door.name);
     let change: DoorChange =
-        block_on(client.set_door(account, &door.serial, command, wait, &std::thread::sleep))?;
+        block_on(client.set_door(account, query, command, wait, &std::thread::sleep))?;
     emit_change(cli, &change);
     Ok(())
 }

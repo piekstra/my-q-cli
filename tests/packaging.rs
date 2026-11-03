@@ -20,6 +20,9 @@ fn manifest() -> Value {
 struct NoSource;
 
 impl Source for NoSource {
+    async fn open_app(&self) -> Result<usize, CliError> {
+        Err(CliError::Other("not called".into()))
+    }
     async fn doors(&self) -> Result<Vec<Door>, CliError> {
         unreachable!()
     }
@@ -49,8 +52,7 @@ fn the_manifest_lists_exactly_the_served_tools() {
     assert_eq!(listed, served);
 }
 
-/// myQ's sign-in can need a one-time code, which an extension's settings cannot
-/// answer, so the extension reads the keychain session and takes no password.
+/// The extension works through the phone, so no setting takes a credential.
 #[test]
 fn every_platform_runs_mcp_and_no_setting_carries_a_credential() {
     let m = manifest();
