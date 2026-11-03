@@ -6,7 +6,7 @@ myQ.
 
 Conforms to the [`piekstra-cli` spec v1](https://github.com/piekstra/cli-common).
 
-> **Status: v0.1.0. Reading a door works; moving one is untested.** myQ's cloud API
+> **Status: v0.1.1. Reading a door works; moving one is untested.** myQ's cloud API
 > refuses this tool: after a real password and one-time code, its gateway answers the
 > token exchange with `401.122`, because the request has no Firebase App Check
 > attestation. Only myQ's own app can provide one, and this tool does not fake it. So
