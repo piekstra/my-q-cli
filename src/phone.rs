@@ -5,6 +5,10 @@
 //! A tap moves a real door, so one is sent only when the screen read just before it
 //! shows exactly one door, at rest, in the state opposite the one asked for. Nothing
 //! retries a tap. Another app's screen is never read beyond its package name.
+//!
+//! An MCP tool passes its call's [`SendDeadline`], and past that nothing goes to the
+//! phone. The CLI's own commands pass none: someone is at the terminal, and no server
+//! has already told them the call failed.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -14,6 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use pk_cli_core::CliError;
+use pk_cli_mcp::SendDeadline;
 
 use crate::door::{self, Door, DoorChange, DoorCommand, Wait};
 
@@ -23,13 +28,20 @@ pub const ENV_ADB: &str = "MYQ_ADB";
 
 const APP_START_TRIES: u32 = 10;
 const APP_START_WAIT: Duration = Duration::from_secs(1);
-const ADB_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const ADB_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// No read of a tool's call starts this long after the call began, so the slowest one, and
+/// the wait before it, still end inside `pk_cli_mcp::CALL_LIMIT`.
+pub(crate) const READ_DEADLINE: Duration = Duration::from_secs(85);
 
 /// What the door logic needs from the phone, so the tests never touch a real one.
 pub trait Phone {
     /// The foreground window's UI hierarchy as XML.
     fn screen_xml(&self) -> Result<String, CliError>;
-    fn open_app(&self) -> Result<(), CliError>;
+    /// The app's launcher activity. Asking changes nothing on the phone.
+    fn launcher_activity(&self) -> Result<String, CliError>;
+    /// Bring that activity to the phone's screen.
+    fn start_activity(&self, activity: &str) -> Result<(), CliError>;
     fn tap(&self, x: u32, y: u32) -> Result<(), CliError>;
 }
 
@@ -96,8 +108,7 @@ impl Phone for Adb {
         self.run(&["exec-out", "uiautomator", "dump", "/dev/tty"])
     }
 
-    /// `am start` rather than `monkey`, whose other events are random taps.
-    fn open_app(&self) -> Result<(), CliError> {
+    fn launcher_activity(&self) -> Result<String, CliError> {
         let resolved = self.run(&[
             "shell",
             "cmd",
@@ -108,12 +119,17 @@ impl Phone for Adb {
             "android.intent.category.LAUNCHER",
             PACKAGE,
         ])?;
-        let component = resolved
+        resolved
             .lines()
             .map(str::trim)
             .rfind(|line| line.starts_with(PACKAGE) && line.contains('/'))
-            .ok_or_else(|| CliError::Upstream("the myQ app is not on this phone".into()))?;
-        self.run(&["shell", "am", "start", "-n", component])?;
+            .map(str::to_string)
+            .ok_or_else(|| CliError::Upstream("the myQ app is not on this phone".into()))
+    }
+
+    /// `am start` rather than `monkey`, whose other events are random taps.
+    fn start_activity(&self, activity: &str) -> Result<(), CliError> {
+        self.run(&["shell", "am", "start", "-n", activity])?;
         Ok(())
     }
 
@@ -322,12 +338,29 @@ fn attr<'a>(node: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
+fn check_in_time(deadline: Option<&SendDeadline>) -> Result<(), CliError> {
+    deadline.map_or(Ok(()), SendDeadline::check)
+}
+
+fn may_read(deadline: Option<&SendDeadline>) -> bool {
+    deadline.is_none_or(|deadline| deadline.elapsed() < READ_DEADLINE)
+}
+
 /// The doors on the app's home screen, bringing the app forward when it is not there.
-fn door_cards<P: Phone>(phone: &P, sleep: &dyn Fn(Duration)) -> Result<Vec<Card>, CliError> {
+fn door_cards<P: Phone>(
+    phone: &P,
+    sleep: &dyn Fn(Duration),
+    deadline: Option<&SendDeadline>,
+) -> Result<Vec<Card>, CliError> {
     let mut screen = parse_screen(&phone.screen_xml()?);
     if !matches!(screen, Screen::Doors(_)) {
-        phone.open_app()?;
+        let activity = phone.launcher_activity()?;
+        check_in_time(deadline)?;
+        phone.start_activity(&activity)?;
         for _ in 0..APP_START_TRIES {
+            if !may_read(deadline) {
+                break;
+            }
             sleep(APP_START_WAIT);
             screen = parse_screen(&phone.screen_xml()?);
             if matches!(screen, Screen::Doors(_)) {
@@ -370,8 +403,12 @@ pub fn doors_on_screen<P: Phone>(phone: &P) -> Result<Vec<Door>, CliError> {
 }
 
 /// The doors, bringing the app to the phone's screen if they are not on it.
-pub fn doors<P: Phone>(phone: &P, sleep: &dyn Fn(Duration)) -> Result<Vec<Door>, CliError> {
-    Ok(door_cards(phone, sleep)?
+pub fn doors<P: Phone>(
+    phone: &P,
+    sleep: &dyn Fn(Duration),
+    deadline: Option<&SendDeadline>,
+) -> Result<Vec<Door>, CliError> {
+    Ok(door_cards(phone, sleep, deadline)?
         .into_iter()
         .map(|card| card.door)
         .collect())
@@ -386,8 +423,9 @@ pub fn set_door<P: Phone>(
     command: DoorCommand,
     wait: Wait,
     sleep: &dyn Fn(Duration),
+    deadline: Option<&SendDeadline>,
 ) -> Result<DoorChange, CliError> {
-    let cards = door_cards(phone, sleep)?;
+    let cards = door_cards(phone, sleep, deadline)?;
     let doors: Vec<Door> = cards.iter().map(|card| card.door.clone()).collect();
     let door = door::find(&doors, query)?.clone();
     if door.state == command.target() {
@@ -424,6 +462,7 @@ pub fn set_door<P: Phone>(
                 door.name
             )));
         };
+        check_in_time(deadline)?;
         phone
             .tap(x, y)
             .map_err(|err| tap_unknown(&door.name, err))?;
@@ -447,7 +486,7 @@ pub fn set_door<P: Phone>(
     }
     // By the clock, not a count of polls: one read can take as long as `ADB_TIMEOUT`.
     let started = Instant::now();
-    while started.elapsed() < wait.timeout {
+    while started.elapsed() < wait.timeout && may_read(deadline) {
         sleep(wait.interval);
         if let Some(read) = read_door(phone, &name) {
             latest = read;
@@ -493,29 +532,35 @@ fn read_door<P: Phone>(phone: &P, name: &str) -> Option<Door> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use pk_cli_mcp::conformance::ManualClock;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
-    const HOME: &str = include_str!("../tests/fixtures/phone_home.xml");
+    pub(crate) const HOME: &str = include_str!("../tests/fixtures/phone_home.xml");
     const FAST: Wait = Wait {
         timeout: Duration::from_millis(30),
         interval: Duration::from_millis(10),
     };
 
     /// Plays its screens in order and repeats the last, recording what it was told.
-    struct Fake {
+    pub(crate) struct Fake {
         screens: RefCell<VecDeque<String>>,
-        taps: RefCell<Vec<(u32, u32)>>,
-        opened: Cell<u32>,
+        pub(crate) taps: RefCell<Vec<(u32, u32)>>,
+        pub(crate) opened: Cell<u32>,
         reads: Cell<u32>,
         read_delay: Duration,
         tap_fails: bool,
+        /// What each step costs on the clock, as a slow adb or a Mac asleep would.
+        pub(crate) clock: ManualClock,
+        pub(crate) read_takes: Cell<Duration>,
+        pub(crate) read_sleeps: Cell<Duration>,
+        pub(crate) resolve_takes: Cell<Duration>,
     }
 
     impl Fake {
-        fn new(screens: &[String]) -> Self {
+        pub(crate) fn new(screens: &[String]) -> Self {
             Self {
                 screens: RefCell::new(screens.iter().cloned().collect()),
                 taps: RefCell::default(),
@@ -523,6 +568,10 @@ mod tests {
                 reads: Cell::new(0),
                 read_delay: Duration::ZERO,
                 tap_fails: false,
+                clock: ManualClock::new(),
+                read_takes: Cell::new(Duration::ZERO),
+                read_sleeps: Cell::new(Duration::ZERO),
+                resolve_takes: Cell::new(Duration::ZERO),
             }
         }
     }
@@ -531,6 +580,8 @@ mod tests {
         fn screen_xml(&self) -> Result<String, CliError> {
             self.reads.set(self.reads.get() + 1);
             std::thread::sleep(self.read_delay);
+            self.clock.advance(self.read_takes.get());
+            self.clock.sleep(self.read_sleeps.get());
             let mut screens = self.screens.borrow_mut();
             let next = if screens.len() > 1 {
                 screens.pop_front()
@@ -540,7 +591,12 @@ mod tests {
             Ok(next.expect("a screen"))
         }
 
-        fn open_app(&self) -> Result<(), CliError> {
+        fn launcher_activity(&self) -> Result<String, CliError> {
+            self.clock.advance(self.resolve_takes.get());
+            Ok(format!("{PACKAGE}/.Dummy"))
+        }
+
+        fn start_activity(&self, _: &str) -> Result<(), CliError> {
             self.opened.set(self.opened.get() + 1);
             Ok(())
         }
@@ -554,11 +610,11 @@ mod tests {
         }
     }
 
-    fn reading(status: &str) -> String {
+    pub(crate) fn reading(status: &str) -> String {
         HOME.replace("Closed for 14 minutes", status)
     }
 
-    fn other_app() -> String {
+    pub(crate) fn other_app() -> String {
         "<hierarchy rotation=\"0\"><node text=\"dummy private text\" resource-id=\"\" \
          package=\"com.example.other\" bounds=\"[0,0][1,1]\"></node></hierarchy>"
             .to_string()
@@ -572,7 +628,7 @@ mod tests {
     }
 
     fn set(fake: &Fake, command: DoorCommand) -> Result<DoorChange, CliError> {
-        set_door(fake, "garage", command, FAST, &|_| {})
+        set_door(fake, "garage", command, FAST, &|_| {}, None)
     }
 
     #[test]
@@ -653,7 +709,7 @@ mod tests {
     #[test]
     fn reading_never_taps() {
         let fake = Fake::new(&[HOME.to_string()]);
-        let doors = doors(&fake, &|_| {}).unwrap();
+        let doors = doors(&fake, &|_| {}, None).unwrap();
         assert_eq!(doors[0].state, "closed");
         assert!(fake.taps.borrow().is_empty());
         assert_eq!(fake.opened.get(), 0, "the app was already in front");
@@ -685,7 +741,7 @@ mod tests {
     #[test]
     fn reading_brings_the_app_forward_when_another_app_is_in_front() {
         let fake = Fake::new(&[other_app(), other_app(), HOME.to_string()]);
-        assert_eq!(doors(&fake, &|_| {}).unwrap().len(), 1);
+        assert_eq!(doors(&fake, &|_| {}, None).unwrap().len(), 1);
         assert_eq!(fake.opened.get(), 1);
         assert!(fake.taps.borrow().is_empty());
     }
@@ -693,7 +749,7 @@ mod tests {
     #[test]
     fn a_locked_phone_says_to_unlock_and_shows_nothing_of_the_other_screen() {
         let fake = Fake::new(&[other_app()]);
-        let err = doors(&fake, &|_| {}).unwrap_err();
+        let err = doors(&fake, &|_| {}, None).unwrap_err();
         assert_eq!(err.exit_code(), 5);
         assert!(err.to_string().contains("Unlock"), "{err}");
         assert!(!err.to_string().contains("dummy private"), "{err}");
@@ -702,7 +758,7 @@ mod tests {
     #[test]
     fn the_app_on_another_tab_says_where_to_go() {
         let page = HOME.replace("resource-id=\"device_name\"", "resource-id=\"other\"");
-        let err = doors(&Fake::new(&[page]), &|_| {}).unwrap_err();
+        let err = doors(&Fake::new(&[page]), &|_| {}, None).unwrap_err();
         assert!(err.to_string().contains("Home tab"), "{err}");
     }
 
@@ -794,6 +850,15 @@ mod tests {
         assert!(fake.taps.borrow().is_empty());
     }
 
+    /// The CLI's own commands pass no deadline: a person at the terminal is watching.
+    #[test]
+    fn without_a_deadline_a_slow_phone_still_gets_its_tap() {
+        let fake = Fake::new(&[HOME.to_string(), reading("Open")]);
+        fake.read_takes.set(Duration::from_secs(60 * 60));
+        assert!(set(&fake, DoorCommand::Open).unwrap().confirmed);
+        assert_eq!(fake.taps.borrow().len(), 1);
+    }
+
     #[test]
     fn a_door_that_never_arrives_is_reported_and_never_tapped_again() {
         let fake = Fake::new(&[HOME.to_string(), reading("Opening")]);
@@ -824,7 +889,7 @@ mod tests {
             timeout: Duration::from_millis(30),
             interval: Duration::from_millis(1),
         };
-        set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}).unwrap_err();
+        set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}, None).unwrap_err();
         assert!(fake.reads.get() <= 5, "{} reads", fake.reads.get());
     }
 
@@ -858,7 +923,7 @@ mod tests {
             interval: Duration::from_millis(10),
         };
         let fake = Fake::new(&[HOME.to_string(), reading("Opening")]);
-        let change = set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}).unwrap();
+        let change = set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}, None).unwrap();
         assert!(change.changed && !change.confirmed);
         assert_eq!(change.door.state, "opening");
     }
@@ -870,7 +935,7 @@ mod tests {
             interval: Duration::from_millis(10),
         };
         let fake = Fake::new(&[HOME.to_string(), other_app()]);
-        let change = set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}).unwrap();
+        let change = set_door(&fake, "garage", DoorCommand::Open, wait, &|_| {}, None).unwrap();
         assert!(change.changed && !change.confirmed);
         assert_eq!(change.door.state, "unknown");
         assert_eq!(change.door.status, None);

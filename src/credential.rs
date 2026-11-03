@@ -174,6 +174,12 @@ impl KeychainStore {
     pub fn delete(&self) -> Result<bool, CliError> {
         self.store.delete(KEYCHAIN_ACCOUNT)
     }
+
+    /// The bearer token `myq mcp --new-token` writes. It is the server's own item, with no myQ
+    /// credential in it, and a server already running keeps the copy it started with.
+    pub fn delete_connector_token(&self) -> Result<bool, CliError> {
+        self.store.delete(pk_cli_mcp::HTTP_TOKEN_ACCOUNT)
+    }
 }
 
 impl Default for KeychainStore {

@@ -4,14 +4,15 @@ use std::time::Duration;
 
 use pk_cli_core::CliError;
 use pk_cli_mcp::{
-    parse_args, ListArgs, Page, PageRequest, Server, ToolDef, ToolError, ToolOutput, Toolset,
+    parse_args, Clock, ListArgs, Page, PageRequest, SendDeadline, Server, SystemClock, ToolDef,
+    ToolError, ToolOutput, Toolset,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::door::{Door, DoorChange, DoorCommand, Wait, POLL_INTERVAL};
-use crate::phone::{self, Adb};
+use crate::phone::{self, Adb, Phone};
 
 const DOORS: &str = "myq_doors";
 const APP_OPEN: &str = "myq_app_open";
@@ -20,6 +21,17 @@ const CLOSE: &str = "myq_door_close";
 
 /// A door takes up to about 20 seconds to travel, and a close sounds its alarm first.
 const TOOL_WAIT: Duration = Duration::from_secs(45);
+
+/// Nothing goes to the phone this long after a call began (DESIGN.md §1.9, "A late write sends
+/// nothing"). Half of what a light's tool allows, for two reasons. A door moves a heavy thing with
+/// the person who asked expecting it within seconds, and one that moves later can close on what is
+/// under it or open the house with nobody looking. And a door's call waits on less: no keychain
+/// and no list, only adb's reads of the screen, each a few seconds, and ten at most when the app
+/// has to come forward. A call that misses this costs a second approval, not a door.
+///
+/// It equals `ADB_TIMEOUT`, so an adb call that hung until it was killed has spent all of it. A tap
+/// sent just inside this still has all of `TOOL_WAIT` before `READ_DEADLINE`.
+const SEND_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What the tools need from the provider, so the tests run offline.
 #[allow(async_fn_in_trait)] // no Send bound: the executor polls on the calling thread
@@ -39,16 +51,44 @@ impl Source for PhoneApp {
     }
 
     async fn open_app(&self) -> Result<usize, CliError> {
-        Ok(phone::doors(&Adb::locate(), &std::thread::sleep)?.len())
+        show_app(&Adb::locate(), &SystemClock, &std::thread::sleep)
     }
 
     async fn set_door(&self, door: &str, command: DoorCommand) -> Result<DoorChange, CliError> {
-        let wait = Wait {
-            timeout: TOOL_WAIT,
-            interval: POLL_INTERVAL,
-        };
-        phone::set_door(&Adb::locate(), door, command, wait, &std::thread::sleep)
+        move_door(
+            &Adb::locate(),
+            &SystemClock,
+            door,
+            command,
+            &std::thread::sleep,
+        )
     }
+}
+
+/// `myq_app_open` on any phone, by any clock.
+fn show_app<P: Phone>(
+    phone: &P,
+    clock: &dyn Clock,
+    sleep: &dyn Fn(Duration),
+) -> Result<usize, CliError> {
+    let deadline = SendDeadline::start(clock, SEND_DEADLINE);
+    Ok(phone::doors(phone, sleep, Some(&deadline))?.len())
+}
+
+/// `myq_door_open` and `myq_door_close` on any phone, by any clock.
+fn move_door<P: Phone>(
+    phone: &P,
+    clock: &dyn Clock,
+    door: &str,
+    command: DoorCommand,
+    sleep: &dyn Fn(Duration),
+) -> Result<DoorChange, CliError> {
+    let deadline = SendDeadline::start(clock, SEND_DEADLINE);
+    let wait = Wait {
+        timeout: TOOL_WAIT,
+        interval: POLL_INTERVAL,
+    };
+    phone::set_door(phone, door, command, wait, sleep, Some(&deadline))
 }
 
 pub struct MyqTools<S> {
@@ -124,7 +164,8 @@ const fn door_description(command: DoorCommand) -> &'static str {
              the door by name. Returns door (name, state, status) as read back afterwards, changed (false when no command was sent because it was already \
              open or opening) \
              and confirmed (true when a read-back showed it open). A door that never reaches the \
-             target state within 45 seconds is an error."
+             target state within 45 seconds is an error. A call that has not reached the door's \
+             button 30 seconds after it began taps nothing and says so."
         }
         DoorCommand::Close => {
             "Physically closes one garage door, which moves it toward anything in its path. Use it \
@@ -132,7 +173,9 @@ const fn door_description(command: DoorCommand) -> &'static str {
              door's name is unclear. Takes the door by name. Returns door (name, state, \
              status) as read back afterwards, changed (false when no command \
              was sent because it was already closed or closing) and confirmed (true when a read-back showed it \
-             closed). A door that never reaches the target state within 45 seconds is an error."
+             closed). A door that never reaches the target state within 45 seconds is an error. A \
+             call that has not reached the door's button 30 seconds after it began taps nothing \
+             and says so."
         }
     }
 }
@@ -220,7 +263,12 @@ impl<S: Source> MyqTools<S> {
             .source
             .doors()
             .await
-            .map_err(|e| fix_not_found(e, format!("Call {APP_OPEN} to bring the app forward")))?
+            .map_err(|e| {
+                fix_not_found(
+                    e,
+                    format!("Call {APP_OPEN} to bring the app forward, or open it on the phone"),
+                )
+            })?
             .into_iter()
             .filter(|d| state.is_none_or(|s| d.state.eq_ignore_ascii_case(s)))
             .map(|d| DoorItem::from(d, detailed))
@@ -257,11 +305,13 @@ pub fn serve(args: &pk_cli_mcp::McpArgs) -> Result<(), CliError> {
 mod tests {
     use super::*;
     use crate::door;
+    use crate::phone::tests::{other_app, reading, Fake, HOME};
     use pk_cli_mcp::conformance::{assert_conforms, assert_fits, call};
+    use pk_cli_mcp::CALL_LIMIT;
     use serde_json::json;
     use std::sync::Mutex;
 
-    struct Fake {
+    struct Listed {
         sent: Mutex<Vec<(String, &'static str)>>,
     }
 
@@ -270,7 +320,7 @@ mod tests {
         door::doors_from(&value)
     }
 
-    impl Source for Fake {
+    impl Source for Listed {
         async fn doors(&self) -> Result<Vec<Door>, CliError> {
             Ok(fixture_doors())
         }
@@ -298,9 +348,9 @@ mod tests {
         }
     }
 
-    fn tools() -> MyqTools<Fake> {
+    fn tools() -> MyqTools<Listed> {
         MyqTools {
-            source: Fake {
+            source: Listed {
                 sent: Mutex::new(Vec::new()),
             },
         }
@@ -445,6 +495,144 @@ mod tests {
             assert!(r.text().contains(DOORS), "{}", r.text());
         }
         assert!(t.source.sent.lock().unwrap().is_empty());
+    }
+
+    /// `move_door` and `show_app` on a phone that moves its own clock, which is all the real
+    /// provider adds to them.
+    struct SlowPhone(Fake);
+
+    impl Source for SlowPhone {
+        async fn doors(&self) -> Result<Vec<Door>, CliError> {
+            phone::doors_on_screen(&self.0)
+        }
+        async fn open_app(&self) -> Result<usize, CliError> {
+            show_app(&self.0, &self.0.clock, &|_| {})
+        }
+        async fn set_door(&self, door: &str, command: DoorCommand) -> Result<DoorChange, CliError> {
+            move_door(&self.0, &self.0.clock, door, command, &|_| {})
+        }
+    }
+
+    fn slow_phone(screens: &[String]) -> MyqTools<SlowPhone> {
+        MyqTools {
+            source: SlowPhone(Fake::new(screens)),
+        }
+    }
+
+    const JUST_UNDER: Duration = Duration::from_millis(29_999);
+
+    #[test]
+    fn a_door_tool_past_its_deadline_taps_nothing_and_says_so() {
+        for tool in [OPEN, CLOSE] {
+            let screen = if tool == OPEN {
+                HOME.to_string()
+            } else {
+                reading("Open")
+            };
+            let t = slow_phone(&[screen]);
+            t.source.0.read_takes.set(SEND_DEADLINE);
+            let r = call(&t, tool, json!({"door": "garage"}));
+            assert!(r.is_error());
+            assert!(r.text().starts_with("other:"), "{}", r.text());
+            assert!(r.text().contains("was not sent"), "{}", r.text());
+            assert!(r.text().contains("over 30 s"), "{}", r.text());
+            assert!(t.source.0.taps.borrow().is_empty(), "{tool}");
+        }
+    }
+
+    #[test]
+    fn a_door_tool_just_inside_its_deadline_taps_once_and_reads_it_back() {
+        let t = slow_phone(&[HOME.to_string(), reading("Open")]);
+        t.source.0.read_takes.set(JUST_UNDER);
+        let r = call(&t, OPEN, json!({"door": "garage"}));
+        let out = assert_fits(&t, OPEN, &r);
+        assert_eq!(out["confirmed"], true);
+        assert_eq!(t.source.0.taps.borrow().len(), 1);
+    }
+
+    /// `Instant` stands still while a Mac sleeps, so only the wall clock sees this night pass.
+    #[test]
+    fn a_door_tool_on_a_mac_that_slept_through_its_read_taps_nothing() {
+        let t = slow_phone(&[HOME.to_string()]);
+        t.source.0.read_sleeps.set(Duration::from_secs(8 * 60 * 60));
+        let r = call(&t, OPEN, json!({"door": "garage"}));
+        assert!(r.text().contains("was not sent"), "{}", r.text());
+        assert!(t.source.0.taps.borrow().is_empty());
+    }
+
+    /// Bringing the app forward is a send too: it replaces what the person has on their screen.
+    #[test]
+    fn a_tool_past_its_deadline_does_not_bring_the_app_forward() {
+        for (tool, args) in [
+            (APP_OPEN, json!({})),
+            (OPEN, json!({"door": "garage"})),
+            (CLOSE, json!({"door": "garage"})),
+        ] {
+            let t = slow_phone(&[other_app()]);
+            t.source.0.read_takes.set(JUST_UNDER);
+            t.source.0.resolve_takes.set(Duration::from_secs(1));
+            let r = call(&t, tool, args);
+            assert!(r.is_error(), "{tool}");
+            assert!(r.text().contains("was not sent"), "{}", r.text());
+            assert_eq!(t.source.0.opened.get(), 0, "{tool}");
+            assert!(t.source.0.taps.borrow().is_empty(), "{tool}");
+        }
+    }
+
+    #[test]
+    fn showing_the_app_just_inside_its_deadline_brings_it_forward() {
+        let t = slow_phone(&[other_app(), HOME.to_string()]);
+        t.source.0.read_takes.set(JUST_UNDER);
+        let r = call(&t, APP_OPEN, json!({}));
+        assert_eq!(assert_fits(&t, APP_OPEN, &r)["doors"], 1);
+        assert_eq!(t.source.0.opened.get(), 1);
+    }
+
+    /// The app came forward in time, and took so long about it that the door's command missed its
+    /// own: the app is on the screen and no door moved.
+    #[test]
+    fn an_app_that_comes_forward_too_slowly_gets_no_tap() {
+        let t = slow_phone(&[other_app(), HOME.to_string()]);
+        t.source.0.read_takes.set(Duration::from_secs(20));
+        let r = call(&t, OPEN, json!({"door": "garage"}));
+        assert!(r.text().contains("was not sent"), "{}", r.text());
+        assert_eq!(t.source.0.opened.get(), 1);
+        assert!(t.source.0.taps.borrow().is_empty());
+    }
+
+    /// A door that never arrives must not keep the call past what `--http` waits for.
+    #[test]
+    fn a_door_that_never_arrives_stops_being_read_in_time() {
+        let t = slow_phone(&[HOME.to_string(), reading("Opening")]);
+        t.source.0.read_takes.set(Duration::from_secs(10));
+        let r = call(&t, OPEN, json!({"door": "garage"}));
+        assert!(r.is_error());
+        assert!(r.text().contains("was tapped"), "{}", r.text());
+        assert_eq!(t.source.0.taps.borrow().len(), 1);
+        let reads = t.source.0.clock.monotonic().as_secs();
+        assert!(reads <= phone::READ_DEADLINE.as_secs() + 10, "{reads}");
+    }
+
+    /// The sums the comments on the deadlines make, held to the limit they name.
+    #[test]
+    fn a_door_tool_answers_inside_the_http_limit() {
+        let send = SEND_DEADLINE.as_secs();
+        let adb = phone::ADB_TIMEOUT.as_secs();
+        let last_read_starts = phone::READ_DEADLINE.as_secs();
+        assert!(send <= adb, "an adb call that hung spends all of it");
+        assert!(send + TOOL_WAIT.as_secs() <= last_read_starts);
+        assert!(send + adb < last_read_starts, "the slowest tap");
+        assert!(last_read_starts + POLL_INTERVAL.as_secs() + adb < CALL_LIMIT.as_secs());
+    }
+
+    /// What a door tool says about its time is what it does.
+    #[test]
+    fn the_door_tools_state_their_limits() {
+        for command in [DoorCommand::Open, DoorCommand::Close] {
+            let text = door_description(command);
+            assert!(text.contains(&format!("{} seconds", TOOL_WAIT.as_secs())));
+            assert!(text.contains(&format!("{} seconds", SEND_DEADLINE.as_secs())));
+        }
     }
 
     #[test]

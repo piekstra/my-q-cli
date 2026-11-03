@@ -12,6 +12,9 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
   `phone::Phone` seam, and `tests/cli_surface.rs` points `MYQ_ADB` at nothing. A screen read
   from another app is dropped after its package name and never printed or kept. `myq_doors`
   stays read-only: bringing the app forward changes the phone, so it is `myq_app_open`'s job.
+- **A tool's call sends nothing late.** `src/mcp.rs` gives `phone::doors` and `phone::set_door` a
+  `pk_cli_mcp::SendDeadline`, and `check_in_time` runs right before each send: the tap and bringing the app
+  forward. A new send to the phone goes behind the same check. The CLI's commands pass none.
 - **API facts come only from the myQ Android app**: its APK or its captured traffic.
   Do not read other myQ integrations, and do not copy their endpoints or flows. Label
   each fact's source in `docs/api.md`.
@@ -27,7 +30,8 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
   `MYQ_KEYCHAIN_SERVICE=<a throwaway name>` to run the two surface tests that read one.
 - **No environment-variable credentials.** The family's spec puts them before the keychain. Here a session
   must keep rotated tokens and what myQ said about the password, or every process would post the password
-  again. `MYQ_EMAIL` and `auth login --from-env` are sign-in inputs only.
+  again. `MYQ_EMAIL` and `auth login --from-env` are sign-in inputs only. `MYQ_MCP_TOKEN` is `mcp --http`'s
+  own bearer token, which reaches no myQ account.
 
 ## Layout
 
@@ -36,7 +40,7 @@ shared crates ([`cli-common`](https://github.com/piekstra/cli-common), spec
 | `src/auth.rs` | The sign-in's requests: PKCE, the form posts, the code step, tokens |
 | `src/signin.rs` | `auth login`'s sequence: what is parked, stored, and refused |
 | `src/client.rs` | API calls, session renewal, the door command and its read-back |
-| `src/credential.rs` | The one keychain item, and the parked sign-in inside it |
+| `src/credential.rs` | The one keychain item for myQ, and the parked sign-in inside it |
 | `src/door.rs` | DTOs, parsing of API responses, and door-reference resolution |
 | `src/phone.rs` | The door path that works: the real app over adb, its screen and its button |
 | `src/hub.rs` | The opener's local status page; read-only |
