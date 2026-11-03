@@ -11,6 +11,7 @@ so their real shape is unverified. Replace each with a scrubbed capture once a l
 | --- | --- |
 | `login_page.html` | The live sign-in page's form, reduced and scrubbed |
 | `hub_sys.json` | A live opener's status document, scrubbed |
+| `phone_home.xml` | A live `uiautomator` read of the app's door card, reduced; the door's name is a dummy |
 | `code_step.html` | Reduced from the live page's structure; values, link targets and label text are dummies or assumed |
 | `accounts.json`, `devices.json`, `token.json` | Hand-written from the app's field names |
 

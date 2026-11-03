@@ -16,10 +16,11 @@ use pk_cli_selfupdate::{SelfUpdateArgs, Updater};
 use serde_json::{json, Value};
 
 use myq::auth;
-use myq::client::{self, unix_now, Client, Wait, POLL_INTERVAL};
+use myq::client::{self, unix_now, Client};
 use myq::config::Config;
 use myq::credential::{Credentials, KeychainStore, TokenStore, ENV_EMAIL};
-use myq::door::{DoorChange, DoorCommand};
+use myq::door::{Door, DoorChange, DoorCommand, Wait, POLL_INTERVAL};
+use myq::phone::{self, Adb};
 use myq::signin::{self, Prompting, Started};
 use myq::{hub, mcp, BIN, VERSION};
 
@@ -32,7 +33,8 @@ struct Cli {
     #[command(flatten)]
     common: CommonArgs,
 
-    /// The myQ account to act on, when the login has more than one (id or name).
+    /// The myQ account to act on with the cloud API (id or name). `doors` without --cloud
+    /// and `mcp` act on the account the phone's app is signed in to, and refuse this.
     #[arg(short, long, global = true, env = "MYQ_ACCOUNT")]
     account: Option<String>,
 
@@ -58,9 +60,8 @@ enum Command {
     /// Every device on the account: doors, hubs, lamps.
     #[command(subcommand)]
     Devices(DevicesCmd),
-    /// Garage doors: read their state, open and close them.
-    #[command(subcommand)]
-    Doors(DoorsCmd),
+    /// Garage doors: read and move them through the myQ app on your Android phone.
+    Doors(DoorsArgs),
     /// The opener's own Wi-Fi status, read directly over the home network.
     #[command(subcommand)]
     Hub(HubCmd),
@@ -145,7 +146,7 @@ enum DevicesCmd {
 
 #[derive(clap::Args, Debug)]
 struct MoveArgs {
-    /// Door name, serial number, or a unique part of its name.
+    /// Door name, or a unique part of it. A serial number works only with --cloud.
     door: String,
     /// Skip the confirmation prompt (required when non-interactive).
     #[arg(long)]
@@ -158,6 +159,15 @@ struct MoveArgs {
     timeout: u64,
 }
 
+#[derive(clap::Args, Debug)]
+struct DoorsArgs {
+    /// Use myQ's cloud API instead of the phone. myQ's App Check gate blocks it today.
+    #[arg(long, global = true)]
+    cloud: bool,
+    #[command(subcommand)]
+    cmd: DoorsCmd,
+}
+
 #[derive(Subcommand, Debug)]
 enum DoorsCmd {
     /// List garage doors and their state (door-list/v1).
@@ -165,7 +175,7 @@ enum DoorsCmd {
     List,
     /// Show one door (door/v1).
     Get {
-        /// Door name, serial number, or a unique part of its name.
+        /// Door name, or a unique part of it. A serial number works only with --cloud.
         door: String,
     },
     /// Open a door, and report what a read-back shows (door-change/v1).
@@ -283,8 +293,8 @@ fn run(cli: &Cli) -> Result<(), CliError> {
         }
         Command::Api(args) => raw_cmd(cli, args),
         Command::Mcp(args) => {
-            let cfg: Config = store.load()?;
-            mcp::serve(args, preferred_account(cli, &cfg))
+            refuse_account(cli)?;
+            mcp::serve(args)
         }
         Command::SelfUpdate(args) => Updater {
             repo: REPO.into(),
@@ -549,12 +559,31 @@ fn accounts_cmd(cli: &Cli, cmd: &AccountsCmd, store: &ConfigStore) -> Result<(),
     }
 }
 
-fn doors_cmd(cli: &Cli, cmd: &DoorsCmd, store: &ConfigStore) -> Result<(), CliError> {
+/// The phone acts on the account its app is signed in to, so a selector could only mislead.
+fn refuse_account(cli: &Cli) -> Result<(), CliError> {
+    if cli.account.is_some() {
+        return Err(CliError::Usage(
+            "--account and MYQ_ACCOUNT apply only to the cloud API: the phone acts on the \
+             account its app is signed in to"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn doors_cmd(cli: &Cli, args: &DoorsArgs, store: &ConfigStore) -> Result<(), CliError> {
+    let cmd = &args.cmd;
     let json = cli.common.json;
+    if !args.cloud {
+        refuse_account(cli)?;
+    }
     // The gate comes first: a driver that forgot --force exits 6 before any
     // keychain or network work (SPEC §1.3).
     if let DoorsCmd::Open(args) | DoorsCmd::Close(args) = cmd {
         confirm::require_confirmable(args.force, cli.common.interactive(), "moving a garage door")?;
+    }
+    if !args.cloud {
+        return phone_doors_cmd(cli, cmd);
     }
     let cfg: Config = store.load()?;
     let client = cloud()?;
@@ -580,6 +609,48 @@ fn doors_cmd(cli: &Cli, cmd: &DoorsCmd, store: &ConfigStore) -> Result<(), CliEr
     }
 }
 
+fn confirm_move(args: &MoveArgs, door: &Door, command: DoorCommand) -> Result<(), CliError> {
+    if door.state == command.target() {
+        return Ok(());
+    }
+    confirm::confirm(
+        args.force,
+        &format!(
+            "{} `{}`, which reads `{}`? This moves the real door.",
+            match command {
+                DoorCommand::Open => "Open",
+                DoorCommand::Close => "Close",
+            },
+            door.name,
+            door.state
+        ),
+    )
+}
+
+fn move_wait(args: &MoveArgs) -> Wait {
+    Wait {
+        timeout: if args.no_wait {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(args.timeout)
+        },
+        interval: POLL_INTERVAL,
+    }
+}
+
+fn emit_change(cli: &Cli, change: &DoorChange) {
+    let mut row = json!({
+        "name": change.door.name,
+        "state": change.door.state,
+        "changed": change.changed,
+        "confirmed": change.confirmed,
+    });
+    if let Some(serial) = &change.door.serial {
+        row["serial"] = json!(serial);
+    }
+    output::emit_one(cli.common.json, "door-change", row);
+}
+
 fn move_door(
     cli: &Cli,
     client: &Client<BlockingTransport, KeychainStore>,
@@ -589,42 +660,45 @@ fn move_door(
 ) -> Result<(), CliError> {
     let doors = block_on(client.doors(account))?;
     let door = myq::door::find(&doors, &args.door)?;
-    if door.state != command.target() {
-        confirm::confirm(
-            args.force,
-            &format!(
-                "{} `{}`, which reads `{}`? This moves the real door.",
-                match command {
-                    DoorCommand::Open => "Open",
-                    DoorCommand::Close => "Close",
-                },
-                door.name,
-                door.state
-            ),
-        )?;
-    }
-    let wait = Wait {
-        timeout: if args.no_wait {
-            Duration::ZERO
-        } else {
-            Duration::from_secs(args.timeout)
-        },
-        interval: POLL_INTERVAL,
-    };
+    confirm_move(args, door, command)?;
+    let wait = move_wait(args);
+    let query = door.serial.as_deref().unwrap_or(&door.name);
     let change: DoorChange =
-        block_on(client.set_door(account, &door.serial, command, wait, &std::thread::sleep))?;
-    output::emit_one(
-        cli.common.json,
-        "door-change",
-        json!({
-            "name": change.door.name,
-            "state": change.door.state,
-            "changed": change.changed,
-            "confirmed": change.confirmed,
-            "serial": change.door.serial,
-        }),
-    );
+        block_on(client.set_door(account, query, command, wait, &std::thread::sleep))?;
+    emit_change(cli, &change);
     Ok(())
+}
+
+fn phone_doors_cmd(cli: &Cli, cmd: &DoorsCmd) -> Result<(), CliError> {
+    let json = cli.common.json;
+    let adb = Adb::locate();
+    let sleep = &std::thread::sleep;
+    match cmd {
+        DoorsCmd::List => {
+            let rows = values(&phone::doors(&adb, sleep)?)?;
+            output::emit_list(json, "door", rows, &["name", "state", "status"]);
+            Ok(())
+        }
+        DoorsCmd::Get { door } => {
+            let doors = phone::doors(&adb, sleep)?;
+            output::emit_one(json, "door", to_value(myq::door::find(&doors, door)?)?);
+            Ok(())
+        }
+        DoorsCmd::Open(args) | DoorsCmd::Close(args) => {
+            let command = if matches!(cmd, DoorsCmd::Open(_)) {
+                DoorCommand::Open
+            } else {
+                DoorCommand::Close
+            };
+            let doors = phone::doors(&adb, sleep)?;
+            let door = myq::door::find(&doors, &args.door)?;
+            confirm_move(args, door, command)?;
+            // A fresh read inside: a prompt can sit for as long as the person likes.
+            let change = phone::set_door(&adb, &door.name, command, move_wait(args), sleep)?;
+            emit_change(cli, &change);
+            Ok(())
+        }
+    }
 }
 
 fn raw_cmd(cli: &Cli, args: &RawArgs) -> Result<(), CliError> {

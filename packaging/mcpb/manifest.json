@@ -4,7 +4,7 @@
   "display_name": "myQ garage door (myq)",
   "version": "0.1.0",
   "description": "Read and move your own myQ garage doors, through the open-source myq CLI.",
-  "long_description": "Ask Claude whether a garage door is open, and have it open or close one. It uses the session `myq auth login` keeps in your OS keychain, so sign in once in a terminal first: myQ's sign-in can need a one-time code, which an extension has no way to answer. Unofficial; not affiliated with Chamberlain Group or myQ.",
+  "long_description": "Ask Claude whether a garage door is open, and have it open or close one. It operates the myQ app on your Android phone over adb, so this computer needs adb and the phone must be connected, unlocked and signed in to myQ. Unofficial; not affiliated with Chamberlain Group or myQ.",
   "author": {
     "name": "piekstra",
     "url": "https://github.com/piekstra"
@@ -40,6 +40,10 @@
     {
       "name": "myq_doors",
       "description": "Your garage doors and whether each is open or closed."
+    },
+    {
+      "name": "myq_app_open",
+      "description": "Bring the myQ app to your phone's screen, so its doors can be read."
     },
     {
       "name": "myq_door_open",

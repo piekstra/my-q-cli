@@ -7,6 +7,7 @@ myQ publishes no API. Everything here comes from the owner's own copy of the And
 | --- | --- |
 | **APK** | Read from the decompiled app and its `assets/myq-config.json`; not yet exercised |
 | **Live** | Observed from the real service |
+| **Owner** | Reported by the owner, not yet exercised by this client |
 | **Assumed** | Neither: a guess this client makes, to be checked against a live run |
 
 ## Hosts
@@ -69,6 +70,33 @@ whose state has a `door_state`.
 `PUT account-devices-gdo…/api/v6.0/accounts/{id}/door_openers/{serial}/open` or `/close`,
 with no body (**APK**). **This client has never sent one.** The app also has
 `lamps/{serial}/on|off`, which this client does not use.
+
+## Through the phone
+
+The cloud is closed to this client (see Traps), so `myq doors` and the MCP tools read and tap
+the genuine app over adb. No widget, Device Controls entry or Quick Settings tile exists to use
+instead (**APK**).
+
+`adb exec-out uiautomator dump /dev/tty` prints the foreground window's hierarchy. On the app's
+Home tab these ids identify a door (**Live**):
+
+| `resource-id` | Holds |
+| --- | --- |
+| `device_name` | The door's name in `text` |
+| `device_status` | Its state in `text`, e.g. `Closed for 14 minutes` |
+| `device_state_icon` | The clickable door button, whose `bounds` give the tap point |
+| `device_settings_icon` | The device's settings, which this client never taps |
+
+- **Wording.** `Closed` is **Live**. `Closing`, `Open` and `Offline` are in the app's strings
+  (**APK**). `Opening` is **Assumed** from its `Door Opening` label.
+- **The tap.** One tap on the button opens a closed door (**Owner**). **This client has never
+  sent one.** Whether a close asks for confirmation, and what the screen shows during travel, are
+  unknown. Anything but the door's own card on screen stops a tap, so a confirmation dialog
+  would end in a timeout rather than a second tap.
+- **Reading during travel.** `uiautomator` can fail to find an idle moment while the screen
+  animates (**Assumed**), so a failed read while waiting is not yet an error.
+- **Several doors.** Only one door has been seen, so telling buttons apart is untested. With more
+  than one door on screen, reads work and taps are refused.
 
 ## The opener on the home network
 
