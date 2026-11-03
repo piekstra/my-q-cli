@@ -11,7 +11,7 @@ so their real shape is unverified. Replace each with a scrubbed capture once a l
 | --- | --- |
 | `login_page.html` | The live sign-in page's form, reduced and scrubbed |
 | `hub_sys.json` | A live opener's status document, scrubbed |
-| `code_step.html` | Hand-written from the input names on the live page; its form markup is assumed |
+| `code_step.html` | Reduced from the live page's structure; values, link targets and label text are dummies or assumed |
 | `accounts.json`, `devices.json`, `token.json` | Hand-written from the app's field names |
 
 ## Scrubbing policy
