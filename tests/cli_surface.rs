@@ -107,6 +107,19 @@ fn completions_render() {
 }
 
 #[test]
+fn no_color_in_the_environment_never_fails_a_command() {
+    // no-color.org: any non-empty value turns color off. cli-common before
+    // v0.15.1 parsed NO_COLOR as a clap bool, so NO_COLOR=1 was a usage error.
+    for v in ["1", "true", "0", ""] {
+        myq()
+            .env("NO_COLOR", v)
+            .args(["completions", "bash"])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
 fn moving_a_door_without_force_exits_6_before_touching_anything() {
     for verb in ["open", "close"] {
         let out = myq()
