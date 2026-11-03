@@ -39,8 +39,9 @@ $ make install
   debugging. If more than one device is connected, `ANDROID_SERIAL` names the phone.
 - The phone on and unlocked when a command runs.
 
-A command brings the app to the phone's screen if another app is in front, and leaves it
-there.
+The CLI's `doors` commands and the MCP open and close tools bring the app to the phone's
+screen if another app is in front, and leave it there. The MCP `myq_doors` tool never does: it
+reports that no door is showing, and `myq_app_open` brings the app forward.
 
 ## Sign in to the cloud API
 
