@@ -83,7 +83,9 @@ with no sign-in (**Live**). It exposes no door control. `myq hub status` reads o
   to a dummy one alike (**Live**), and the app labels that code `REFRESH_APP_CHECK_FAILED`
   (**APK**). The sign-in page, password and text-message code all work without it, so the
   failure appears only after a code has been spent. `begin` therefore checks the gate with a
-  dummy code before posting the password. This client does not fake attestation.
+  dummy code before posting the password, and goes on only if myQ rejects that code with a
+  400 and an `error`. What an open gate answers is **Assumed**, since it has only been seen
+  closed. This client does not fake attestation.
 - **A password post may send a code.** Retrying a sign-in can spend codes and walk the
   account toward a lockout, so nothing here retries one, and a session that ends on a login
   needing a code asks for a person instead of posting the password.

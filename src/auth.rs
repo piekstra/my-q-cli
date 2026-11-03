@@ -190,7 +190,7 @@ enum Landing {
 }
 
 fn refused(response: &HttpResponse) -> Option<CliError> {
-    if response.status == 401 && gateway_code(&response.body).is_some_and(is_no_attestation) {
+    if response.status == 401 && is_no_attestation(&response.body) {
         return Some(CliError::Upstream(format!(
             "myQ refused this client ({NO_ATTESTATION}, \"the application is unauthorized\"). \
              Its token endpoint requires a Firebase App Check attestation from myQ's own app, \
@@ -208,13 +208,13 @@ fn refused(response: &HttpResponse) -> Option<CliError> {
     })
 }
 
-fn gateway_code(body: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    parsed.get("code")?.as_str().map(str::to_string)
-}
-
-fn is_no_attestation(code: String) -> bool {
-    code.starts_with(NO_ATTESTATION)
+fn is_no_attestation(body: &str) -> bool {
+    let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    parsed
+        .as_ref()
+        .and_then(|v| v.get("code"))
+        .and_then(|code| code.as_str())
+        .is_some_and(|code| code.starts_with(NO_ATTESTATION))
 }
 
 /// Follow redirects until a page or the authorization code.
@@ -643,7 +643,9 @@ fn parse_tokens(response: &HttpResponse) -> Result<Tokens, CliError> {
 
 /// Ask the token endpoint whether it will serve this client, before a password post
 /// texts a code that could never be redeemed. The gate gives a dummy code the same
-/// refusal as a real one, and an open gate spends nothing on a dummy code.
+/// refusal as a real one, and an open gate spends nothing on a dummy code. Only the
+/// rejection a dummy code should get lets the sign-in go on, since the next step
+/// spends a code.
 async fn check_token_gate<T: Transport>(transport: &T) -> Result<(), CliError> {
     let body = form_body(&[
         ("client_id", CLIENT_ID),
@@ -656,13 +658,17 @@ async fn check_token_gate<T: Transport>(transport: &T) -> Result<(), CliError> {
     if let Some(err) = refused(&response) {
         return Err(err);
     }
-    if response.status >= 500 {
-        return Err(CliError::Upstream(format!(
-            "myQ's token endpoint answered {}",
-            token_refusal(&response)
-        )));
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&response.body).ok();
+    let rejected_the_code =
+        response.status == 400 && parsed.as_ref().is_some_and(|v| v.get("error").is_some());
+    if rejected_the_code {
+        return Ok(());
     }
-    Ok(())
+    Err(CliError::Upstream(format!(
+        "myQ's token endpoint answered {} to a check before sign-in, so the password was \
+         not posted",
+        token_refusal(&response)
+    )))
 }
 
 /// The app also sends a `Firebase-AppCheck-Token` header here. This client
@@ -1086,6 +1092,36 @@ mod tests {
             !body.contains("dummy-pass") && !body.contains("dummy%40")
         }));
         assert!(header_of(&sent[2], "firebase-appcheck-token").is_none());
+    }
+
+    #[test]
+    fn only_the_rejection_of_a_dummy_code_lets_the_password_go_out() {
+        for gate in [
+            HttpResponse::new(500, ""),
+            HttpResponse::new(503, "<html>"),
+            HttpResponse::new(429, ""),
+            HttpResponse::new(403, "denied"),
+            HttpResponse::new(401, r#"{"code":"401.999"}"#),
+            HttpResponse::new(400, "not json"),
+            HttpResponse::new(200, TOKEN),
+        ] {
+            let status = gate.status;
+            let scripted = Scripted::new(vec![
+                redirect("/Account/Login?ReturnUrl=x"),
+                HttpResponse::new(200, LOGIN_PAGE),
+                gate,
+            ]);
+            let err = block_on(begin(
+                &scripted,
+                "dummy@example.invalid",
+                "dummy-pass",
+                &pkce(),
+            ))
+            .unwrap_err();
+            assert_eq!(err.exit_code(), 5, "{status}");
+            assert!(err.to_string().contains("not posted"), "{status}: {err}");
+            assert_eq!(scripted.sent().len(), 3, "{status}");
+        }
     }
 
     #[test]
