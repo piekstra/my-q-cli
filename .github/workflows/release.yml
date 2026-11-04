@@ -14,6 +14,10 @@ name: release
 # code, can write to the repository; building and packing (cargo, npx)
 # happen with a read-only token that checkout does not persist.
 #
+# `publish` attaches whatever was built to a draft, even when one OS failed, and
+# publishes it only once every expected asset is there. A missing one fails the
+# run and leaves the draft, and `self-update` keeps finding the last whole release.
+#
 # A pull request that changes how releases are built runs every job but
 # `publish` as a dry run: everything is built and packed, nothing is
 # attached to a release.
@@ -163,10 +167,11 @@ jobs:
           retention-days: 7
           if-no-files-found: error
 
-  # Attaches whatever was built, even when one OS failed, so a dead macOS
-  # queue still leaves the Linux and Windows tarballs on the release.
+  # Attaches whatever was built to a draft, even when one OS failed, so a dead
+  # macOS queue still leaves the Linux and Windows tarballs there. Publishes the
+  # draft only when nothing expected is missing, and otherwise fails.
   publish:
-    name: attach to the release
+    name: publish the release
     needs: [version, build, mcpb]
     if: ${{ !cancelled() && needs.version.result == 'success' && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
@@ -179,10 +184,29 @@ jobs:
           path: dist
           merge-multiple: true
       - run: ls -l dist
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          draft: true
           files: |
             dist/myq-*.tar.gz
             dist/myq-*.tar.gz.sha256
             dist/myq-*.mcpb
             dist/myq-*.mcpb.sha256
+      - name: Every expected asset was attached
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          missing=0
+          for t in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            for f in "myq-$t.tar.gz" "myq-$t.tar.gz.sha256"; do
+              [ -f "dist/$f" ] || { echo "::error::missing $f"; missing=1; }
+            done
+          done
+          for f in "myq-$version.mcpb" "myq-$version.mcpb.sha256"; do
+            [ -f "dist/$f" ] || { echo "::error::missing $f"; missing=1; }
+          done
+          exit "$missing"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest
