@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 — 2026-11-04
+
+- `auth logout --forget` says what it does not end whether or not the keychain held a connector token: a server on `$MYQ_MCP_TOKEN` never had an item to remove.
+- cli-common v0.29.0, up from v0.25.0, which brings the Windows config and self-update fixes.
+
 ## 0.2.0 — 2026-11-03
 
 - A late door command sends nothing. `myq_door_open`, `myq_door_close` and `myq_app_open` check the
