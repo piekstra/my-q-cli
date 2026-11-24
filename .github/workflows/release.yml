@@ -42,7 +42,7 @@ jobs:
     name: the tag names the crate's version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
       - run: |
@@ -73,10 +73,10 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
@@ -106,13 +106,13 @@ jobs:
           lipo -create -output bin/universal-apple-darwin/myq \
             bin/aarch64-apple-darwin/myq bin/x86_64-apple-darwin/myq
           lipo -info bin/universal-apple-darwin/myq
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bin-${{ runner.os }}
           path: bin/
           retention-days: 3
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ runner.os }}
           path: |
@@ -126,17 +126,20 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: bin-*
           path: bin
           merge-multiple: true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         with:
           node-version: 22
+          # Nothing is installed from a lockfile; a cache could only be
+          # poisoned.
+          package-manager-cache: false
       # The manifest's version must be the crate's, or Claude Desktop would show
       # one version and run another.
       - name: Assemble, validate and pack
@@ -150,7 +153,7 @@ jobs:
           fi
           stage="$RUNNER_TEMP/myq"
           mkdir -p "$stage/server/linux"
-          cp packaging/mcpb/manifest.json LICENSE-MIT LICENSE-APACHE "$stage/"
+          cp packaging/mcpb/manifest.json LICENSE "$stage/"
           cp bin/universal-apple-darwin/myq "$stage/server/myq"
           cp bin/x86_64-pc-windows-msvc/myq.exe "$stage/server/myq.exe"
           cp bin/x86_64-unknown-linux-gnu/myq "$stage/server/linux/myq"
@@ -160,7 +163,7 @@ jobs:
           npx -y @anthropic-ai/mcpb@2.1.2 pack "$stage" "myq-$version.mcpb"
           sha256sum "myq-$version.mcpb" > "myq-$version.mcpb.sha256"
           unzip -Z "myq-$version.mcpb"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-mcpb
           path: myq-*.mcpb*
@@ -178,7 +181,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: dist-*
           path: dist
